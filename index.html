@@ -1,0 +1,952 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>No-Guess Minesweeper</title>
+    <style>
+        :root {
+            --bg-color: #f0f2f5;
+            --cell-hidden: #b0bec5;
+            --cell-revealed: #e0e0e0;
+            --cell-hover: #cfd8dc;
+            --accent: #2196f3;
+            --text: #37474f;
+            --shadow: rgba(0,0,0,0.1);
+        }
+        
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: var(--bg-color);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            touch-action: none; /* Crucial for custom touch handling */
+            user-select: none;
+            -webkit-user-select: none;
+        }
+
+        #game-container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        canvas {
+            display: block;
+            box-shadow: 0 4px 6px var(--shadow);
+            border-radius: 4px;
+        }
+
+        #ui-overlay {
+            position: absolute;
+            top: 20px;
+            left: 0;
+            width: 100%;
+            pointer-events: none;
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+        }
+
+        .hud-panel {
+            background: white;
+            padding: 10px 20px;
+            border-radius: 20px;
+            box-shadow: 0 2px 4px var(--shadow);
+            font-weight: bold;
+            color: var(--text);
+            pointer-events: auto;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        #game-over-modal {
+            display: none;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: white;
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            text-align: center;
+            z-index: 100;
+        }
+
+        #game-over-modal h2 {
+            margin-top: 0;
+            color: var(--text);
+        }
+
+        button {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        button:active {
+            opacity: 0.8;
+        }
+
+        .loading-spinner {
+            display: none;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 50;
+            background: rgba(255,255,255,0.8);
+            padding: 20px;
+            border-radius: 8px;
+            font-weight: bold;
+        }
+        
+        /* Disable context menu specifically for the canvas */
+        canvas {
+            -webkit-touch-callout: none;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <canvas id="gameCanvas"></canvas>
+    
+    <div id="ui-overlay">
+        <div class="hud-panel">
+            <span>💣</span> <span id="mine-count">15</span>
+        </div>
+        <div class="hud-panel">
+            <span>⏱️</span> <span id="timer">0</span>
+        </div>
+    </div>
+
+    <div id="loading" class="loading-spinner">Generating No-Guess Board...</div>
+
+    <div id="game-over-modal">
+        <h2 id="modal-title">Game Over</h2>
+        <p id="modal-message">Better luck next time!</p>
+        <button id="restart-btn">New Game</button>
+    </div>
+</div>
+
+<script>
+/**
+ * NO-GUESS MINESWEEPER
+ * Core Logic & UI
+ */
+
+// --- CONFIGURATION ---
+const ROWS = 14;
+const COLS = 10;
+const TOTAL_MINES = 20;
+const TILE_SIZE = 50; // Base logical size
+
+// Colors
+const COLORS = {
+    hidden: '#90A4AE',
+    revealed: '#ECEFF1',
+    border: '#ffffff',
+    text: '#37474f',
+    flag: '#e53935',
+    mine: '#263238',
+    highlight: '#CFD8DC', // Chording highlight
+    nums: [
+        '', // 0
+        '#1976D2', // 1
+        '#388E3C', // 2
+        '#D32F2F', // 3
+        '#7B1FA2', // 4
+        '#FF8F00', // 5
+        '#0097A7', // 6
+        '#424242', // 7
+        '#E91E63'  // 8
+    ]
+};
+
+// --- GAME STATE ---
+let grid = [];
+let minesLeft = TOTAL_MINES;
+let isGameOver = false;
+let isFirstClick = true;
+let startTime = 0;
+let timerInterval = null;
+let generatedBoardCache = null;
+
+// Camera / Input State
+let camera = { x: 0, y: 0, scale: 1.0 };
+let input = {
+    isDragging: false,
+    lastX: 0, lastY: 0,
+    pointers: new Map(),
+    longPressTimer: null,
+    isLongPress: false,
+    clickStartCamera: {x:0, y:0}
+};
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const dpr = window.devicePixelRatio || 1;
+
+// --- INITIALIZATION ---
+
+function init() {
+    resizeCanvas();
+    window.addEventListener('resize', resizeCanvas);
+    
+    setupInput();
+    resetGame();
+    
+    requestAnimationFrame(render);
+}
+
+function resizeCanvas() {
+    const container = document.getElementById('game-container');
+    canvas.width = container.clientWidth * dpr;
+    canvas.height = container.clientHeight * dpr;
+    canvas.style.width = container.clientWidth + 'px';
+    canvas.style.height = container.clientHeight + 'px';
+    ctx.scale(dpr, dpr);
+    
+    // Center board initially
+    centerCamera();
+}
+
+function centerCamera() {
+    const boardW = COLS * TILE_SIZE;
+    const boardH = ROWS * TILE_SIZE;
+    const screenW = canvas.width / dpr;
+    const screenH = canvas.height / dpr;
+    
+    camera.scale = Math.min(screenW / (boardW + 40), screenH / (boardH + 40), 1.5);
+    camera.x = (screenW - boardW * camera.scale) / 2;
+    camera.y = (screenH - boardH * camera.scale) / 2;
+}
+
+function resetGame() {
+    isGameOver = false;
+    isFirstClick = true;
+    minesLeft = TOTAL_MINES;
+    updateHUD();
+    stopTimer();
+    document.getElementById('timer').innerText = '0';
+    document.getElementById('game-over-modal').style.display = 'none';
+    
+    // Initialize empty grid
+    grid = [];
+    for (let r = 0; r < ROWS; r++) {
+        let row = [];
+        for (let c = 0; c < COLS; c++) {
+            row.push({
+                r, c,
+                isMine: false,
+                isRevealed: false,
+                isFlagged: false,
+                neighborMines: 0
+            });
+        }
+        grid.push(row);
+    }
+    
+    requestAnimationFrame(render);
+}
+
+// --- CORE GAMEPLAY LOGIC ---
+
+// Returns true if game logic was executed (reveal/flag), false if just camera move
+function handleTap(r, c, isLong) {
+    if (isGameOver) return;
+    
+    if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return;
+    const cell = grid[r][c];
+
+    if (isLong) {
+        // Flagging
+        if (!cell.isRevealed) {
+            toggleFlag(cell);
+        }
+        return;
+    }
+
+    // Normal Click
+    if (cell.isFlagged) return;
+
+    if (cell.isRevealed) {
+        // Chording
+        tryChording(cell);
+    } else {
+        // Reveal
+        if (isFirstClick) {
+            generateSolvableBoard(r, c).then((success) => {
+                if(success) reveal(cell);
+                else alert("Could not generate a solvable board in time. Retrying...");
+            });
+        } else {
+            reveal(cell);
+        }
+    }
+}
+
+function toggleFlag(cell) {
+    if (cell.isRevealed) return;
+    cell.isFlagged = !cell.isFlagged;
+    minesLeft += cell.isFlagged ? -1 : 1;
+    updateHUD();
+    
+    // Mobile Vibrate
+    if (navigator.vibrate) navigator.vibrate(50);
+}
+
+function reveal(cell) {
+    if (cell.isRevealed || cell.isFlagged) return;
+    
+    cell.isRevealed = true;
+
+    if (cell.isMine) {
+        gameOver(false);
+        return;
+    }
+
+    if (cell.neighborMines === 0) {
+        // Flood fill
+        const stack = [cell];
+        while (stack.length > 0) {
+            const current = stack.pop();
+            getNeighbors(current.r, current.c).forEach(n => {
+                if (!n.isRevealed && !n.isFlagged) {
+                    n.isRevealed = true;
+                    if (n.neighborMines === 0) {
+                        stack.push(n);
+                    }
+                }
+            });
+        }
+    }
+
+    checkWin();
+}
+
+function tryChording(cell) {
+    const neighbors = getNeighbors(cell.r, cell.c);
+    const flagCount = neighbors.filter(n => n.isFlagged).length;
+    
+    if (flagCount === cell.neighborMines) {
+        neighbors.forEach(n => {
+            if (!n.isRevealed && !n.isFlagged) {
+                reveal(n);
+            }
+        });
+    }
+}
+
+function getNeighbors(r, c) {
+    const neighbors = [];
+    for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+            if (dr === 0 && dc === 0) continue;
+            const nr = r + dr, nc = c + dc;
+            if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS) {
+                neighbors.push(grid[nr][nc]);
+            }
+        }
+    }
+    return neighbors;
+}
+
+function checkWin() {
+    let unrevealedSafe = 0;
+    for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+            if (!grid[r][c].isMine && !grid[r][c].isRevealed) {
+                unrevealedSafe++;
+            }
+        }
+    }
+    if (unrevealedSafe === 0) {
+        gameOver(true);
+    }
+}
+
+function gameOver(win) {
+    isGameOver = true;
+    stopTimer();
+    
+    // Reveal all mines if lost
+    if (!win) {
+        grid.flat().forEach(cell => {
+            if (cell.isMine && !cell.isFlagged) cell.isRevealed = true;
+        });
+    } else {
+        // Flag all mines if won
+        minesLeft = 0;
+        grid.flat().forEach(cell => {
+            if (cell.isMine) cell.isFlagged = true;
+        });
+        updateHUD();
+    }
+
+    const modal = document.getElementById('game-over-modal');
+    document.getElementById('modal-title').innerText = win ? "You Won!" : "Game Over";
+    document.getElementById('modal-message').innerText = win ? `Time: ${document.getElementById('timer').innerText}s` : "Hit a mine!";
+    modal.style.display = 'block';
+}
+
+function startTimer() {
+    startTime = Date.now();
+    timerInterval = setInterval(() => {
+        const delta = Math.floor((Date.now() - startTime) / 1000);
+        document.getElementById('timer').innerText = delta;
+    }, 1000);
+}
+
+function stopTimer() {
+    if (timerInterval) clearInterval(timerInterval);
+}
+
+function updateHUD() {
+    document.getElementById('mine-count').innerText = minesLeft;
+}
+
+// --- GENERATOR & SOLVER (The "No Guess" Magic) ---
+
+async function generateSolvableBoard(startR, startC) {
+    document.getElementById('loading').style.display = 'block';
+    
+    // Wait a frame to let UI render loading
+    await new Promise(resolve => setTimeout(resolve, 10));
+
+    let attempts = 0;
+    const maxAttempts = 200;
+
+    while (attempts < maxAttempts) {
+        attempts++;
+        
+        // 1. Clear grid
+        grid.forEach(row => row.forEach(c => {
+            c.isMine = false;
+            c.isRevealed = false;
+            c.isFlagged = false;
+            c.neighborMines = 0;
+        }));
+
+        // 2. Place Mines (Safe Start)
+        // Reserve Start cell AND neighbors (guarantees a 0 opening)
+        const safeZone = new Set();
+        safeZone.add(`${startR},${startC}`);
+        getNeighbors(startR, startC).forEach(n => safeZone.add(`${n.r},${n.c}`));
+
+        let minesToPlace = TOTAL_MINES;
+        while (minesToPlace > 0) {
+            const r = Math.floor(Math.random() * ROWS);
+            const c = Math.floor(Math.random() * COLS);
+            if (!grid[r][c].isMine && !safeZone.has(`${r},${c}`)) {
+                grid[r][c].isMine = true;
+                minesToPlace--;
+            }
+        }
+
+        // 3. Calculate Numbers
+        for(let r=0; r<ROWS; r++){
+            for(let c=0; c<COLS; c++){
+                if(!grid[r][c].isMine){
+                    grid[r][c].neighborMines = getNeighbors(r, c).filter(n => n.isMine).length;
+                }
+            }
+        }
+
+        // 4. Run Solver
+        if (checkSolvability(startR, startC)) {
+            isFirstClick = false;
+            startTimer();
+            document.getElementById('loading').style.display = 'none';
+            return true;
+        }
+    }
+
+    document.getElementById('loading').style.display = 'none';
+    return false;
+}
+
+/**
+ * Checks if the current board is solvable using logic without guessing.
+ * Uses:
+ * 1. Trivial logic (flag count == number, hidden count == number - flags)
+ * 2. Set/Tank logic (backtracking on boundary components)
+ */
+function checkSolvability(startR, startC) {
+    // Create a virtual board state to simulate solving
+    // State: 0=Hidden, 1=Revealed, 2=Flagged
+    const state = grid.map(row => row.map(c => ({
+        ...c,
+        status: 'hidden' // hidden, revealed, flagged
+    })));
+    
+    // Initial Move
+    const queue = [{r: startR, c: startC}];
+    
+    function getVirtualNeighbors(r, c) {
+        const n = [];
+        for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+                if (dr === 0 && dc === 0) continue;
+                const nr = r + dr, nc = c + dc;
+                if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS) {
+                    n.push(state[nr][nc]);
+                }
+            }
+        }
+        return n;
+    }
+
+    // Helper to reveal in virtual state
+    function vReveal(cell) {
+        if (cell.status !== 'hidden') return false;
+        cell.status = 'revealed';
+        if (cell.isMine) return false; // Should not happen if logic is correct
+        
+        // If 0, cascade
+        if (cell.neighborMines === 0) {
+            const neighbors = getVirtualNeighbors(cell.r, cell.c);
+            neighbors.forEach(n => vReveal(n));
+        }
+        return true;
+    }
+
+    vReveal(state[startR][startC]);
+
+    let progress = true;
+    while (progress) {
+        progress = false;
+        
+        // 1. Basic Heuristics
+        let changed = false;
+        for (let r = 0; r < ROWS; r++) {
+            for (let c = 0; c < COLS; c++) {
+                const cell = state[r][c];
+                if (cell.status === 'revealed' && cell.neighborMines > 0) {
+                    const neighbors = getVirtualNeighbors(r, c);
+                    const hidden = neighbors.filter(n => n.status === 'hidden');
+                    const flagged = neighbors.filter(n => n.status === 'flagged');
+                    
+                    if (hidden.length === 0) continue;
+
+                    // Rule 1: Flags match number -> Reveal rest
+                    if (flagged.length === cell.neighborMines) {
+                        hidden.forEach(n => {
+                            vReveal(n);
+                            changed = true;
+                        });
+                    }
+                    // Rule 2: Hidden + Flags equals number -> Flag rest
+                    else if (hidden.length + flagged.length === cell.neighborMines) {
+                        hidden.forEach(n => {
+                            n.status = 'flagged';
+                            changed = true;
+                        });
+                    }
+                }
+            }
+        }
+        
+        if (changed) {
+            progress = true;
+            continue;
+        }
+
+        // 2. Tank Solver (Backtracking on Boundary)
+        // Only run if basic heuristics fail
+        if (runTankSolver(state, getVirtualNeighbors)) {
+            progress = true;
+        }
+    }
+
+    // Check if won
+    for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+            if (state[r][c].status === 'hidden' && !state[r][c].isMine) return false; // Stuck
+        }
+    }
+    return true;
+}
+
+// Advanced Solver: Finds boundary, segments it, checks all permutations
+function runTankSolver(state, getNeighborsFunc) {
+    // 1. Identify Boundary Cells (Hidden cells adjacent to Revealed numbers)
+    const boundary = new Set();
+    const constraints = []; // { cell: revealedCell, minesLeft: N, neighbors: [boundaryCells] }
+
+    for(let r=0; r<ROWS; r++){
+        for(let c=0; c<COLS; c++){
+            const cell = state[r][c];
+            if(cell.status === 'revealed' && cell.neighborMines > 0){
+                const neighbors = getNeighborsFunc(r, c);
+                const hidden = neighbors.filter(n => n.status === 'hidden');
+                const flagged = neighbors.filter(n => n.status === 'flagged');
+                
+                if(hidden.length > 0){
+                    hidden.forEach(h => boundary.add(h));
+                    constraints.push({
+                        cell: cell,
+                        needed: cell.neighborMines - flagged.length,
+                        targets: hidden
+                    });
+                }
+            }
+        }
+    }
+
+    if(boundary.size === 0) return false;
+
+    // 2. Segment boundary into connected components to optimize
+    // (Skipped for simplicity in this prototype, treating whole boundary as one group. 
+    // On 10x14 this is fast enough. If slow, segmentation is needed).
+    
+    const boundaryList = Array.from(boundary);
+    // Sort boundary for better pruning? Not strictly necessary for small boards.
+
+    // Map boundary cells to index
+    const bMap = new Map();
+    boundaryList.forEach((b, i) => bMap.set(b, i));
+
+    // Optimize constraints: map targets to indices
+    const optConstraints = constraints.map(k => ({
+        needed: k.needed,
+        indices: k.targets.map(t => bMap.get(t))
+    }));
+
+    // 3. Backtracking
+    // solutions[i] = true if cell i can be a mine, false if it can be safe?
+    // Actually we need to count how many valid solutions have cell i as Mine vs Safe.
+    const canBeMine = new Array(boundaryList.length).fill(false);
+    const canBeSafe = new Array(boundaryList.length).fill(false);
+    
+    // Current assignment: 0=Safe, 1=Mine, -1=Unassigned
+    const assignment = new Array(boundaryList.length).fill(-1);
+
+    function solveRec(idx) {
+        if(idx >= boundaryList.length){
+            // Valid solution found
+            for(let i=0; i<boundaryList.length; i++){
+                if(assignment[i] === 1) canBeMine[i] = true;
+                else canBeSafe[i] = true;
+            }
+            return true; // Found at least one
+        }
+
+        // Try Safe (0)
+        assignment[idx] = 0;
+        if(isValid(idx)){
+            solveRec(idx + 1);
+        }
+
+        // Try Mine (1)
+        assignment[idx] = 1;
+        if(isValid(idx)){
+            solveRec(idx + 1);
+        }
+        
+        assignment[idx] = -1; // Backtrack
+    }
+
+    function isValid(uptoIdx) {
+        // Check all constraints that are fully determined or violated
+        for(let k of optConstraints){
+            let placed = 0;
+            let unknown = 0;
+            for(let idx of k.indices){
+                if(assignment[idx] === 1) placed++;
+                else if(assignment[idx] === -1) unknown++;
+            }
+            
+            // Constraint violated: Too many mines
+            if(placed > k.needed) return false;
+            // Constraint violated: Not enough space for mines
+            if(placed + unknown < k.needed) return false;
+        }
+        return true;
+    }
+
+    solveRec(0);
+
+    let madeProgress = false;
+    for(let i=0; i<boundaryList.length; i++){
+        const cell = boundaryList[i];
+        if(canBeMine[i] && !canBeSafe[i]){
+            // MUST be a mine
+            cell.status = 'flagged';
+            madeProgress = true;
+        } else if(!canBeMine[i] && canBeSafe[i]){
+            // MUST be safe
+            cell.status = 'revealed'; // In simulation
+             // If this was real game we'd call reveal(cell), here we simulate ripple?
+             // For solvability check, simply marking revealed is enough to trigger next logic pass
+            madeProgress = true;
+        }
+    }
+    
+    return madeProgress;
+}
+
+
+// --- INPUT SYSTEM ---
+
+function setupInput() {
+    // Touch Events
+    canvas.addEventListener('touchstart', onTouchStart, {passive: false});
+    canvas.addEventListener('touchmove', onTouchMove, {passive: false});
+    canvas.addEventListener('touchend', onTouchEnd, {passive: false});
+    
+    // Mouse Events (wrap to look like touch)
+    canvas.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    canvas.addEventListener('contextmenu', e => { e.preventDefault(); return false; });
+    
+    document.getElementById('restart-btn').addEventListener('click', resetGame);
+}
+
+function onTouchStart(e) {
+    e.preventDefault();
+    for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        input.pointers.set(t.identifier, {x: t.clientX, y: t.clientY, startX: t.clientX, startY: t.clientY});
+    }
+    handlePointerDown();
+}
+
+function onTouchMove(e) {
+    e.preventDefault();
+    for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        const p = input.pointers.get(t.identifier);
+        if(p) { p.x = t.clientX; p.y = t.clientY; }
+    }
+    handlePointerMove();
+}
+
+function onTouchEnd(e) {
+    e.preventDefault();
+    handlePointerUp(); // Logic to determine click
+    for (let i = 0; i < e.changedTouches.length; i++) {
+        input.pointers.delete(e.changedTouches[i].identifier);
+    }
+    if (input.pointers.size === 0) {
+        input.isDragging = false;
+    }
+}
+
+// Mouse wrappers
+function onMouseDown(e) {
+    if(e.button !== 0 && e.button !== 2) return;
+    input.pointers.set(999, {x: e.clientX, y: e.clientY, startX: e.clientX, startY: e.clientY});
+    handlePointerDown();
+    // If right click, flag immediately simulation? 
+    // For consistency with requirements, we rely on long press or UI toggle? 
+    // Requirement says "Long Press: Place/remove flag". 
+    // But desktop users expect right click. I'll support right click as "instant long press".
+    if (e.button === 2) {
+        input.isLongPress = true; // Force long press logic immediately
+        clearTimeout(input.longPressTimer); // Clear the timer so we don't trigger twice
+    }
+}
+function onMouseMove(e) {
+    const p = input.pointers.get(999);
+    if(p) { p.x = e.clientX; p.y = e.clientY; handlePointerMove(); }
+}
+function onMouseUp(e) {
+    if(input.pointers.has(999)) {
+        handlePointerUp();
+        input.pointers.delete(999);
+        input.isDragging = false;
+    }
+}
+
+// Unified Pointer Logic
+function handlePointerDown() {
+    if (input.pointers.size === 1) {
+        // Potential Click or Long Press
+        input.isDragging = false;
+        input.clickStartCamera = { ...camera };
+        
+        // Start Long Press Timer
+        input.isLongPress = false;
+        const p = Array.from(input.pointers.values())[0]; // Get the pointer
+        
+        input.longPressTimer = setTimeout(() => {
+            if (!input.isDragging) {
+                input.isLongPress = true;
+                
+                // Execute Flag Logic Immediately
+                // Screen to World
+                const wx = (p.x - camera.x) / camera.scale;
+                const wy = (p.y - camera.y) / camera.scale;
+                const c = Math.floor(wx / TILE_SIZE);
+                const r = Math.floor(wy / TILE_SIZE);
+                
+                handleTap(r, c, true); // true = isLongPress
+
+                // Visual feedback
+                if (navigator.vibrate) navigator.vibrate(20);
+            }
+        }, 500); // 500ms for long press
+    } else if (input.pointers.size === 2) {
+        // Pinch start - cancel click/longpress
+        clearTimeout(input.longPressTimer);
+        input.isDragging = true;
+        input.baseDist = getPinchDist();
+        input.baseScale = camera.scale;
+    }
+}
+
+function handlePointerMove() {
+    const ptrs = Array.from(input.pointers.values());
+    
+    if (input.pointers.size === 1) {
+        // Dragging / Panning
+        const p = ptrs[0];
+        const dx = p.x - p.startX;
+        const dy = p.y - p.startY;
+        
+        // Threshold to cancel "Tap"
+        if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
+            clearTimeout(input.longPressTimer);
+            input.isDragging = true;
+            
+            // Pan logic
+            camera.x += (p.x - input.lastX);
+            camera.y += (p.y - input.lastY);
+        }
+        
+        input.lastX = p.x;
+        input.lastY = p.y;
+    } 
+    else if (input.pointers.size === 2) {
+        // Pinch / Pan
+        const dist = getPinchDist();
+        const center = getPinchCenter();
+        
+        // Zoom
+        const newScale = input.baseScale * (dist / input.baseDist);
+        // Clamp scale
+        const clampedScale = Math.max(0.5, Math.min(newScale, 3.0));
+        
+        // Zoom around center... simplified: just scale
+        // To do it properly we need to adjust camera.x/y based on offset.
+        // For prototype, simple scale update + center adjust is okay.
+        
+        const oldScale = camera.scale;
+        const scaleRatio = clampedScale / oldScale;
+        
+        // Adjust camera position to keep center point stable
+        // World coordinates of center
+        const wx = (center.x - camera.x) / oldScale;
+        const wy = (center.y - camera.y) / oldScale;
+        
+        camera.x = center.x - wx * clampedScale;
+        camera.y = center.y - wy * clampedScale;
+        camera.scale = clampedScale;
+
+        input.lastX = center.x;
+        input.lastY = center.y;
+    }
+}
+
+function handlePointerUp() {
+    clearTimeout(input.longPressTimer);
+    
+    if (!input.isDragging && input.pointers.size === 1 && !input.isLongPress) {
+        // Valid Tap (Only if not already processed as long press)
+        const p = Array.from(input.pointers.values())[0];
+        
+        // Screen to World
+        const wx = (p.x - camera.x) / camera.scale;
+        const wy = (p.y - camera.y) / camera.scale;
+        
+        const c = Math.floor(wx / TILE_SIZE);
+        const r = Math.floor(wy / TILE_SIZE);
+        
+        handleTap(r, c, false);
+    }
+}
+
+function getPinchDist() {
+    const ptrs = Array.from(input.pointers.values());
+    return Math.hypot(ptrs[0].x - ptrs[1].x, ptrs[0].y - ptrs[1].y);
+}
+
+function getPinchCenter() {
+    const ptrs = Array.from(input.pointers.values());
+    return { x: (ptrs[0].x + ptrs[1].x)/2, y: (ptrs[0].y + ptrs[1].y)/2 };
+}
+
+// --- RENDER LOOP ---
+
+function render() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+    // Grid Background
+    const boardW = COLS * TILE_SIZE;
+    const boardH = ROWS * TILE_SIZE;
+    
+    ctx.save();
+    ctx.translate(camera.x, camera.y);
+    ctx.scale(camera.scale, camera.scale);
+    
+    // Draw Board Background
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, boardW, boardH);
+
+    // Draw Cells
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 24px sans-serif';
+
+    for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+            const cell = grid[r][c];
+            const x = c * TILE_SIZE;
+            const y = r * TILE_SIZE;
+            
+            // Base Tile
+            ctx.fillStyle = cell.isRevealed ? COLORS.revealed : COLORS.hidden;
+            if (cell.isRevealed && cell.isMine) ctx.fillStyle = '#ef9a9a'; // Exploded mine
+            ctx.fillRect(x + 1, y + 1, TILE_SIZE - 2, TILE_SIZE - 2);
+            
+            // Content
+            if (cell.isRevealed) {
+                if (cell.isMine) {
+                    ctx.fillStyle = COLORS.mine;
+                    ctx.fillText('💣', x + TILE_SIZE/2, y + TILE_SIZE/2 + 2);
+                } else if (cell.neighborMines > 0) {
+                    ctx.fillStyle = COLORS.nums[cell.neighborMines] || '#000';
+                    ctx.fillText(cell.neighborMines, x + TILE_SIZE/2, y + TILE_SIZE/2 + 2);
+                }
+            } else if (cell.isFlagged) {
+                ctx.fillText('🚩', x + TILE_SIZE/2, y + TILE_SIZE/2 + 2);
+            }
+        }
+    }
+
+    ctx.restore();
+    requestAnimationFrame(render);
+}
+
+// Start
+init();
+
+</script>
+</body>
+</html>
