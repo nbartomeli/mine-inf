@@ -145,17 +145,17 @@
 
 <script>
 /**
- * NO-GUESS MINESWEEPER
- * Core Logic & UI
+ * INFINITE NO-GUESS MINESWEEPER
+ * Chunk-based Architecture
  */
 
 // --- CONFIGURATION ---
-const ROWS = 14;
-const COLS = 10;
-const TOTAL_MINES = 20;
-const TILE_SIZE = 50; // Base logical size
+const CHUNK_SIZE = 10;
+const TILE_SIZE = 50;
+const BASE_DENSITY = 0.15;
+const MAX_DENSITY = 0.38;
+const DENSITY_GROWTH = 0.10; // 10% increase per chunk
 
-// Colors
 const COLORS = {
     hidden: '#90A4AE',
     revealed: '#ECEFF1',
@@ -163,30 +163,20 @@ const COLORS = {
     text: '#37474f',
     flag: '#e53935',
     mine: '#263238',
-    highlight: '#CFD8DC', // Chording highlight
-    nums: [
-        '', // 0
-        '#1976D2', // 1
-        '#388E3C', // 2
-        '#D32F2F', // 3
-        '#7B1FA2', // 4
-        '#FF8F00', // 5
-        '#0097A7', // 6
-        '#424242', // 7
-        '#E91E63'  // 8
-    ]
+    highlight: '#CFD8DC',
+    fog: '#cfd8dc', // Background for empty space
+    nums: ['', '#1976D2', '#388E3C', '#D32F2F', '#7B1FA2', '#FF8F00', '#0097A7', '#424242', '#E91E63']
 };
 
 // --- GAME STATE ---
-let grid = [];
-let minesLeft = TOTAL_MINES;
+const chunks = new Map(); // Key: "cx,cy", Value: Chunk Object
+let activeChunkKey = null; // The chunk currently being played
+let solvedChunks = 0;
 let isGameOver = false;
-let isFirstClick = true;
 let startTime = 0;
 let timerInterval = null;
-let generatedBoardCache = null;
 
-// Camera / Input State
+// Camera / Input
 let camera = { x: 0, y: 0, scale: 1.0 };
 let input = {
     isDragging: false,
@@ -201,15 +191,51 @@ const canvas = document.getElementById('gameCanvas');
 const ctx = canvas.getContext('2d');
 const dpr = window.devicePixelRatio || 1;
 
+// --- DATA STRUCTURES ---
+
+class Chunk {
+    constructor(cx, cy, density) {
+        this.cx = cx;
+        this.cy = cy;
+        this.density = density;
+        this.isSolved = false;
+        this.grid = []; // Local 10x10 grid
+        this.initGrid();
+    }
+
+    initGrid() {
+        for (let r = 0; r < CHUNK_SIZE; r++) {
+            let row = [];
+            for (let c = 0; c < CHUNK_SIZE; c++) {
+                row.push({
+                    r: r, c: c, // Local coords
+                    gr: this.cy * CHUNK_SIZE + r, // Global coords
+                    gc: this.cx * CHUNK_SIZE + c,
+                    isMine: false,
+                    isRevealed: false,
+                    isFlagged: false,
+                    neighborMines: 0
+                });
+            }
+            this.grid.push(row);
+        }
+    }
+
+    get(r, c) {
+        if (r >= 0 && r < CHUNK_SIZE && c >= 0 && c < CHUNK_SIZE) {
+            return this.grid[r][c];
+        }
+        return null;
+    }
+}
+
 // --- INITIALIZATION ---
 
 function init() {
     resizeCanvas();
     window.addEventListener('resize', resizeCanvas);
-    
     setupInput();
     resetGame();
-    
     requestAnimationFrame(render);
 }
 
@@ -220,449 +246,454 @@ function resizeCanvas() {
     canvas.style.width = container.clientWidth + 'px';
     canvas.style.height = container.clientHeight + 'px';
     ctx.scale(dpr, dpr);
-    
-    // Center board initially
-    centerCamera();
-}
-
-function centerCamera() {
-    const boardW = COLS * TILE_SIZE;
-    const boardH = ROWS * TILE_SIZE;
-    const screenW = canvas.width / dpr;
-    const screenH = canvas.height / dpr;
-    
-    camera.scale = Math.min(screenW / (boardW + 40), screenH / (boardH + 40), 1.5);
-    camera.x = (screenW - boardW * camera.scale) / 2;
-    camera.y = (screenH - boardH * camera.scale) / 2;
 }
 
 function resetGame() {
     isGameOver = false;
-    isFirstClick = true;
-    minesLeft = TOTAL_MINES;
-    updateHUD();
+    solvedChunks = 0;
+    chunks.clear();
     stopTimer();
     document.getElementById('timer').innerText = '0';
+    document.getElementById('mine-count').innerText = '-';
     document.getElementById('game-over-modal').style.display = 'none';
+
+    // Spawn First Chunk at 0,0
+    spawnChunk(0, 0, true);
+    centerCameraOnChunk(0, 0);
+}
+
+function centerCameraOnChunk(cx, cy) {
+    const chunkPx = CHUNK_SIZE * TILE_SIZE;
+    const screenW = canvas.width / dpr;
+    const screenH = canvas.height / dpr;
     
-    // Initialize empty grid
-    grid = [];
-    for (let r = 0; r < ROWS; r++) {
-        let row = [];
-        for (let c = 0; c < COLS; c++) {
-            row.push({
-                r, c,
-                isMine: false,
-                isRevealed: false,
-                isFlagged: false,
-                neighborMines: 0
-            });
-        }
-        grid.push(row);
-    }
+    // Target global center of the chunk
+    const targetX = (cx * CHUNK_SIZE * TILE_SIZE) + (chunkPx / 2);
+    const targetY = (cy * CHUNK_SIZE * TILE_SIZE) + (chunkPx / 2);
+
+    // Initial scale
+    const targetScale = Math.min(screenW / (chunkPx + 100), screenH / (chunkPx + 100), 1.2);
     
-    requestAnimationFrame(render);
+    // Animate or set? Set for now.
+    camera.scale = targetScale;
+    camera.x = (screenW / 2) - (targetX * camera.scale);
+    camera.y = (screenH / 2) - (targetY * camera.scale);
 }
 
-// --- CORE GAMEPLAY LOGIC ---
+// --- CHUNK MANAGEMENT ---
 
-// Returns true if game logic was executed (reveal/flag), false if just camera move
-function handleTap(r, c, isLong) {
-    if (isGameOver) return;
+// Returns the Global Cell at global row/col
+function getGlobalCell(gr, gc) {
+    const cx = Math.floor(gc / CHUNK_SIZE);
+    const cy = Math.floor(gr / CHUNK_SIZE);
+    const chunk = chunks.get(`${cx},${cy}`);
+    if (!chunk) return null;
     
-    if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return;
-    const cell = grid[r][c];
-
-    if (isLong) {
-        // Flagging
-        if (!cell.isRevealed) {
-            toggleFlag(cell);
-        }
-        return;
-    }
-
-    // Normal Click
-    if (cell.isFlagged) return;
-
-    if (cell.isRevealed) {
-        // Chording
-        tryChording(cell);
-    } else {
-        // Reveal
-        if (isFirstClick) {
-            generateSolvableBoard(r, c).then((success) => {
-                if(success) reveal(cell);
-                else alert("Could not generate a solvable board in time. Retrying...");
-            });
-        } else {
-            reveal(cell);
-        }
-    }
-}
-
-function toggleFlag(cell) {
-    if (cell.isRevealed) return;
-    cell.isFlagged = !cell.isFlagged;
-    minesLeft += cell.isFlagged ? -1 : 1;
-    updateHUD();
+    // Local conversion handles negative coords correctly via Math.floor above?
+    // Math.floor(-0.1) is -1. 
+    // If gr=-1, cy=-1. Local r?
+    // -1 % 10 = -1 in JS. We need positive modulus.
+    const r = ((gr % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+    const c = ((gc % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
     
-    // Mobile Vibrate
-    if (navigator.vibrate) navigator.vibrate(50);
+    return chunk.get(r, c);
 }
 
-function reveal(cell) {
-    if (cell.isRevealed || cell.isFlagged) return;
-    
-    cell.isRevealed = true;
+function spawnChunk(cx, cy, isFirst) {
+    const density = Math.min(MAX_DENSITY, BASE_DENSITY * Math.pow(1 + DENSITY_GROWTH, solvedChunks));
+    const chunk = new Chunk(cx, cy, density);
+    chunks.set(`${cx},${cy}`, chunk);
+    activeChunkKey = `${cx},${cy}`;
 
-    if (cell.isMine) {
-        gameOver(false);
-        return;
-    }
-
-    if (cell.neighborMines === 0) {
-        // Flood fill
-        const stack = [cell];
-        while (stack.length > 0) {
-            const current = stack.pop();
-            getNeighbors(current.r, current.c).forEach(n => {
-                if (!n.isRevealed && !n.isFlagged) {
-                    n.isRevealed = true;
-                    if (n.neighborMines === 0) {
-                        stack.push(n);
-                    }
-                }
-            });
-        }
-    }
-
-    checkWin();
-}
-
-function tryChording(cell) {
-    const neighbors = getNeighbors(cell.r, cell.c);
-    const flagCount = neighbors.filter(n => n.isFlagged).length;
-    
-    if (flagCount === cell.neighborMines) {
-        neighbors.forEach(n => {
-            if (!n.isRevealed && !n.isFlagged) {
-                reveal(n);
-            }
-        });
-    }
-}
-
-function getNeighbors(r, c) {
-    const neighbors = [];
-    for (let dr = -1; dr <= 1; dr++) {
-        for (let dc = -1; dc <= 1; dc++) {
-            if (dr === 0 && dc === 0) continue;
-            const nr = r + dr, nc = c + dc;
-            if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS) {
-                neighbors.push(grid[nr][nc]);
-            }
-        }
-    }
-    return neighbors;
-}
-
-function checkWin() {
-    let unrevealedSafe = 0;
-    for (let r = 0; r < ROWS; r++) {
-        for (let c = 0; c < COLS; c++) {
-            if (!grid[r][c].isMine && !grid[r][c].isRevealed) {
-                unrevealedSafe++;
-            }
-        }
-    }
-    if (unrevealedSafe === 0) {
-        gameOver(true);
-    }
-}
-
-function gameOver(win) {
-    isGameOver = true;
-    stopTimer();
-    
-    // Reveal all mines if lost
-    if (!win) {
-        grid.flat().forEach(cell => {
-            if (cell.isMine && !cell.isFlagged) cell.isRevealed = true;
-        });
-    } else {
-        // Flag all mines if won
-        minesLeft = 0;
-        grid.flat().forEach(cell => {
-            if (cell.isMine) cell.isFlagged = true;
-        });
-        updateHUD();
-    }
-
-    const modal = document.getElementById('game-over-modal');
-    document.getElementById('modal-title').innerText = win ? "You Won!" : "Game Over";
-    document.getElementById('modal-message').innerText = win ? `Time: ${document.getElementById('timer').innerText}s` : "Hit a mine!";
-    modal.style.display = 'block';
-}
-
-function startTimer() {
-    startTime = Date.now();
-    timerInterval = setInterval(() => {
-        const delta = Math.floor((Date.now() - startTime) / 1000);
-        document.getElementById('timer').innerText = delta;
-    }, 1000);
-}
-
-function stopTimer() {
-    if (timerInterval) clearInterval(timerInterval);
-}
-
-function updateHUD() {
-    document.getElementById('mine-count').innerText = minesLeft;
-}
-
-// --- GENERATOR & SOLVER (The "No Guess" Magic) ---
-
-async function generateSolvableBoard(startR, startC) {
     document.getElementById('loading').style.display = 'block';
-    
-    // Wait a frame to let UI render loading
-    await new Promise(resolve => setTimeout(resolve, 10));
 
-    let attempts = 0;
+    // Async generation to not freeze UI
+    setTimeout(() => {
+        generateChunk(chunk, isFirst).then(success => {
+            document.getElementById('loading').style.display = 'none';
+            if (success) {
+                updateHUD();
+                startTimer();
+            } else {
+                console.error("Failed to generate valid chunk");
+                // Fallback or retry?
+            }
+        });
+    }, 50);
+}
+
+async function generateChunk(chunk, isFirst) {
     const maxAttempts = 200;
+    const totalCells = CHUNK_SIZE * CHUNK_SIZE;
+    const targetMines = Math.floor(totalCells * chunk.density);
 
-    while (attempts < maxAttempts) {
-        attempts++;
-        
-        // 1. Clear grid
-        grid.forEach(row => row.forEach(c => {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        // Reset Local
+        chunk.grid.forEach(row => row.forEach(c => {
             c.isMine = false;
             c.isRevealed = false;
             c.isFlagged = false;
             c.neighborMines = 0;
         }));
 
-        // 2. Place Mines (Safe Start)
-        // Reserve Start cell AND neighbors (guarantees a 0 opening)
-        const safeZone = new Set();
-        safeZone.add(`${startR},${startC}`);
-        getNeighbors(startR, startC).forEach(n => safeZone.add(`${n.r},${n.c}`));
+        // Place Mines
+        // If first chunk, ensure safe start (center)
+        // If later chunk, satisfy constraints (consistency with neighbors)
+        
+        let minesPlaced = 0;
+        const safeSet = new Set();
+        
+        if (isFirst) {
+            // Reserve center 2x2 for safe start
+            const mid = Math.floor(CHUNK_SIZE/2);
+            safeSet.add(`${mid},${mid}`);
+            safeSet.add(`${mid+1},${mid}`);
+            safeSet.add(`${mid},${mid+1}`);
+            safeSet.add(`${mid+1},${mid+1}`);
+        }
 
-        let minesToPlace = TOTAL_MINES;
-        while (minesToPlace > 0) {
-            const r = Math.floor(Math.random() * ROWS);
-            const c = Math.floor(Math.random() * COLS);
-            if (!grid[r][c].isMine && !safeZone.has(`${r},${c}`)) {
-                grid[r][c].isMine = true;
-                minesToPlace--;
+        // Random Placement
+        while (minesPlaced < targetMines) {
+            const r = Math.floor(Math.random() * CHUNK_SIZE);
+            const c = Math.floor(Math.random() * CHUNK_SIZE);
+            if (!chunk.grid[r][c].isMine && !safeSet.has(`${r},${c}`)) {
+                chunk.grid[r][c].isMine = true;
+                minesPlaced++;
             }
         }
 
-        // 3. Calculate Numbers
-        for(let r=0; r<ROWS; r++){
-            for(let c=0; c<COLS; c++){
-                if(!grid[r][c].isMine){
-                    grid[r][c].neighborMines = getNeighbors(r, c).filter(n => n.isMine).length;
-                }
-            }
-        }
+        // Calculate Numbers (internally + boundary check)
+        calculateNumbers(chunk);
 
-        // 4. Run Solver
-        if (checkSolvability(startR, startC)) {
-            isFirstClick = false;
-            startTimer();
-            document.getElementById('loading').style.display = 'none';
+        // CHECK 1: Consistency with neighbors
+        // The new chunk MUST NOT contradict the numbers revealed on the border of existing chunks.
+        if (!checkBoundaryConsistency(chunk)) continue;
+
+        // CHECK 2: Solvability
+        // If first chunk: Solve from center.
+        // If later chunk: Solve from the "seam" (touching edges).
+        if (checkChunkSolvability(chunk, isFirst)) {
+            // Success
+            if (isFirst) {
+                 // Auto-reveal the safe start
+                 const mid = Math.floor(CHUNK_SIZE/2);
+                 reveal(chunk.grid[mid][mid]);
+            }
             return true;
         }
     }
-
-    document.getElementById('loading').style.display = 'none';
     return false;
 }
 
-/**
- * Checks if the current board is solvable using logic without guessing.
- * Uses:
- * 1. Trivial logic (flag count == number, hidden count == number - flags)
- * 2. Set/Tank logic (backtracking on boundary components)
- */
-function checkSolvability(startR, startC) {
-    // Create a virtual board state to simulate solving
-    // State: 0=Hidden, 1=Revealed, 2=Flagged
-    const state = grid.map(row => row.map(c => ({
-        ...c,
-        status: 'hidden' // hidden, revealed, flagged
-    })));
+// Calculates neighbor counts for the chunk.
+// CRITICAL: Must count mines in *adjacent chunks* if they exist.
+function calculateNumbers(chunk) {
+    chunk.grid.forEach(row => row.forEach(cell => {
+        if (!cell.isMine) {
+            cell.neighborMines = countGlobalMines(cell.gr, cell.gc);
+        }
+    }));
+}
+
+function countGlobalMines(gr, gc) {
+    let count = 0;
+    for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+            if (dr === 0 && dc === 0) continue;
+            // Check global map
+            const n = getGlobalCell(gr + dr, gc + dc);
+            if (n && n.isMine) count++;
+        }
+    }
+    return count;
+}
+
+function checkBoundaryConsistency(chunk) {
+    // Look at all neighbors of this chunk.
+    // For every cell in the neighbor that touches this chunk,
+    // recalculate its number. It MUST match its static 'neighborMines'.
+    // If it doesn't match, it means our new mines contradict the old clues.
     
-    // Initial Move
-    const queue = [{r: startR, c: startC}];
+    // We only need to check the "Seam".
+    // Iterate global neighbors of this chunk's border.
     
-    function getVirtualNeighbors(r, c) {
-        const n = [];
-        for (let dr = -1; dr <= 1; dr++) {
-            for (let dc = -1; dc <= 1; dc++) {
-                if (dr === 0 && dc === 0) continue;
-                const nr = r + dr, nc = c + dc;
-                if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS) {
-                    n.push(state[nr][nc]);
+    const deltas = [[0, -1], [0, 1], [-1, 0], [1, 0]]; // N, S, E, W chunks
+    
+    for (let [dcy, dcx] of deltas) {
+        const neighborChunk = chunks.get(`${chunk.cx + dcx},${chunk.cy + dcy}`);
+        if (!neighborChunk) continue;
+
+        // For simplicity, check EVERY cell in the neighbor? No, just the edge.
+        // Optimization: Just check the relevant edge.
+        let rStart = 0, rEnd = CHUNK_SIZE, cStart = 0, cEnd = CHUNK_SIZE;
+        
+        if (dcx === -1) { cStart = CHUNK_SIZE-1; cEnd = CHUNK_SIZE; } // Left Chunk's Right Edge
+        if (dcx === 1)  { cStart = 0; cEnd = 1; } // Right Chunk's Left Edge
+        if (dcy === -1) { rStart = CHUNK_SIZE-1; rEnd = CHUNK_SIZE; } // Top Chunk's Bottom Edge
+        if (dcy === 1)  { rStart = 0; rEnd = 1; } // Bottom Chunk's Top Edge
+
+        for (let r = rStart; r < rEnd; r++) {
+            for (let c = cStart; c < cEnd; c++) {
+                const nCell = neighborChunk.grid[r][c];
+                // If it's revealed, its number must be valid
+                if (nCell.isRevealed && !nCell.isMine) {
+                    const currentCount = countGlobalMines(nCell.gr, nCell.gc);
+                    if (currentCount !== nCell.neighborMines) return false;
                 }
             }
-        }
-        return n;
-    }
-
-    // Helper to reveal in virtual state
-    function vReveal(cell) {
-        if (cell.status !== 'hidden') return false;
-        cell.status = 'revealed';
-        if (cell.isMine) return false; // Should not happen if logic is correct
-        
-        // If 0, cascade
-        if (cell.neighborMines === 0) {
-            const neighbors = getVirtualNeighbors(cell.r, cell.c);
-            neighbors.forEach(n => vReveal(n));
-        }
-        return true;
-    }
-
-    vReveal(state[startR][startC]);
-
-    let progress = true;
-    while (progress) {
-        progress = false;
-        
-        // 1. Basic Heuristics
-        let changed = false;
-        for (let r = 0; r < ROWS; r++) {
-            for (let c = 0; c < COLS; c++) {
-                const cell = state[r][c];
-                if (cell.status === 'revealed' && cell.neighborMines > 0) {
-                    const neighbors = getVirtualNeighbors(r, c);
-                    const hidden = neighbors.filter(n => n.status === 'hidden');
-                    const flagged = neighbors.filter(n => n.status === 'flagged');
-                    
-                    if (hidden.length === 0) continue;
-
-                    // Rule 1: Flags match number -> Reveal rest
-                    if (flagged.length === cell.neighborMines) {
-                        hidden.forEach(n => {
-                            vReveal(n);
-                            changed = true;
-                        });
-                    }
-                    // Rule 2: Hidden + Flags equals number -> Flag rest
-                    else if (hidden.length + flagged.length === cell.neighborMines) {
-                        hidden.forEach(n => {
-                            n.status = 'flagged';
-                            changed = true;
-                        });
-                    }
-                }
-            }
-        }
-        
-        if (changed) {
-            progress = true;
-            continue;
-        }
-
-        // 2. Tank Solver (Backtracking on Boundary)
-        // Only run if basic heuristics fail
-        if (runTankSolver(state, getVirtualNeighbors)) {
-            progress = true;
-        }
-    }
-
-    // Check if won
-    for (let r = 0; r < ROWS; r++) {
-        for (let c = 0; c < COLS; c++) {
-            if (state[r][c].status === 'hidden' && !state[r][c].isMine) return false; // Stuck
         }
     }
     return true;
 }
 
-// Advanced Solver: Finds boundary, segments it, checks all permutations
-function runTankSolver(state, getNeighborsFunc) {
-    // 1. Identify Boundary Cells (Hidden cells adjacent to Revealed numbers)
-    const boundary = new Set();
-    const constraints = []; // { cell: revealedCell, minesLeft: N, neighbors: [boundaryCells] }
+// --- SOLVER ---
 
-    for(let r=0; r<ROWS; r++){
-        for(let c=0; c<COLS; c++){
-            const cell = state[r][c];
-            if(cell.status === 'revealed' && cell.neighborMines > 0){
-                const neighbors = getNeighborsFunc(r, c);
-                const hidden = neighbors.filter(n => n.status === 'hidden');
-                const flagged = neighbors.filter(n => n.status === 'flagged');
-                
-                if(hidden.length > 0){
-                    hidden.forEach(h => boundary.add(h));
-                    constraints.push({
-                        cell: cell,
-                        needed: cell.neighborMines - flagged.length,
-                        targets: hidden
-                    });
+function checkChunkSolvability(chunk, isFirst) {
+    // Virtual state for solver
+    // We need to simulate the state of the *World* locally, but only this chunk is unknown.
+    // Existing chunks are "Known".
+    
+    const state = chunk.grid.map(row => row.map(c => ({
+        ...c,
+        status: 'hidden' // hidden, revealed, flagged
+    })));
+
+    // Initial Moves
+    let queue = [];
+    
+    if (isFirst) {
+        const mid = Math.floor(CHUNK_SIZE/2);
+        queue.push(state[mid][mid]);
+    } else {
+        // Add all cells adjacent to *revealed* cells of neighbor chunks
+        // i.e., the "Seam" is our entry point.
+        for (let r = 0; r < CHUNK_SIZE; r++) {
+            for (let c = 0; c < CHUNK_SIZE; c++) {
+                if (hasRevealedNeighbor(state[r][c].gr, state[r][c].gc)) {
+                    // Check if this cell itself should be auto-revealed?
+                    // No, the solver logic handles that. We just need to ensure the Logic CAN see it.
+                    // Actually, the "Tank" solver works on boundary. 
+                    // We just need to run the logic loop.
                 }
             }
         }
     }
 
-    if(boundary.size === 0) return false;
+    // Solver Helper: Access Virtual or Real cells
+    function getVCell(gr, gc) {
+        // Is it inside current chunk?
+        const localR = gr - (chunk.cy * CHUNK_SIZE);
+        const localC = gc - (chunk.cx * CHUNK_SIZE);
+        if (localR >= 0 && localR < CHUNK_SIZE && localC >= 0 && localC < CHUNK_SIZE) {
+            return state[localR][localC];
+        }
+        // It's an external cell. Return a read-only object representing real state
+        const real = getGlobalCell(gr, gc);
+        if (real) {
+            return {
+                ...real,
+                status: real.isRevealed ? 'revealed' : (real.isFlagged ? 'flagged' : 'hidden'),
+                isExternal: true
+            };
+        }
+        return null; // Void
+    }
 
-    // 2. Segment boundary into connected components to optimize
-    // (Skipped for simplicity in this prototype, treating whole boundary as one group. 
-    // On 10x14 this is fast enough. If slow, segmentation is needed).
+    function getVNeighbors(vCell) {
+        const res = [];
+        for(let dr=-1; dr<=1; dr++){
+            for(let dc=-1; dc<=1; dc++){
+                if(dr===0 && dc===0) continue;
+                const n = getVCell(vCell.gr + dr, vCell.gc + dc);
+                if(n) res.push(n);
+            }
+        }
+        return res;
+    }
+
+    // If first chunk, we execute the first reveal manually in virtual state
+    if (isFirst) {
+        const mid = Math.floor(CHUNK_SIZE/2);
+        vReveal(state[mid][mid]);
+    }
+
+    // For subsequent chunks, the "Logic" comes from the external revealed neighbors looking IN.
+    
+    function vReveal(vc) {
+        if (vc.status !== 'hidden') return;
+        vc.status = 'revealed';
+        if (vc.isMine) return; // Fail
+        if (vc.neighborMines === 0) {
+            getVNeighbors(vc).forEach(n => !n.isExternal && vReveal(n));
+        }
+    }
+
+    // Solver Loop
+    let progress = true;
+    while (progress) {
+        progress = false;
+        let changed = false;
+
+        // Iterate ALL relevant cells:
+        // 1. Internal revealed cells
+        // 2. External revealed cells that touch this chunk
+        
+        const cellsToCheck = [];
+        
+        // Add internal
+        state.flat().forEach(c => {
+            if (c.status === 'revealed') cellsToCheck.push(c);
+        });
+
+        // Add external border cells
+        // (Optimization: we could cache these)
+        const deltas = [[0, -1], [0, 1], [-1, 0], [1, 0]];
+        deltas.forEach(([dcy, dcx]) => {
+            const nc = chunks.get(`${chunk.cx+dcx},${chunk.cy+dcy}`);
+            if(nc) {
+                nc.grid.flat().forEach(real => {
+                    if (real.isRevealed && isTouchingChunk(real, chunk)) {
+                         cellsToCheck.push({
+                             ...real,
+                             status: 'revealed',
+                             isExternal: true
+                         });
+                    }
+                });
+            }
+        });
+
+        for (let cell of cellsToCheck) {
+            if (cell.neighborMines > 0) {
+                const neighbors = getVNeighbors(cell);
+                const hidden = neighbors.filter(n => n.status === 'hidden');
+                const flagged = neighbors.filter(n => n.status === 'flagged');
+                
+                if (hidden.length === 0) continue;
+
+                if (flagged.length === cell.neighborMines) {
+                    hidden.forEach(n => {
+                        if (!n.isExternal) { vReveal(n); changed = true; }
+                    });
+                } else if (hidden.length + flagged.length === cell.neighborMines) {
+                    hidden.forEach(n => {
+                        if (!n.isExternal) { n.status = 'flagged'; changed = true; }
+                    });
+                }
+            }
+        }
+
+        if (changed) {
+            progress = true; 
+            continue;
+        }
+
+        // Run Tank Solver if stuck
+        // Only on boundary of UNKNOWN cells
+        if (runTankSolver(state, getVNeighbors)) {
+            progress = true;
+        }
+    }
+
+    // Verification: Are all safe cells revealed?
+    for (let r = 0; r < CHUNK_SIZE; r++) {
+        for (let c = 0; c < CHUNK_SIZE; c++) {
+            if (state[r][c].status === 'hidden' && !state[r][c].isMine) return false;
+        }
+    }
+    return true;
+}
+
+function isTouchingChunk(cell, chunk) {
+    // A cell touches a chunk if it is adjacent to any cell in that chunk
+    // Simplification: Check coordinate distance
+    const minGr = chunk.cy * CHUNK_SIZE;
+    const maxGr = minGr + CHUNK_SIZE - 1;
+    const minGc = chunk.cx * CHUNK_SIZE;
+    const maxGc = minGc + CHUNK_SIZE - 1;
+    
+    return (cell.gr >= minGr - 1 && cell.gr <= maxGr + 1 &&
+            cell.gc >= minGc - 1 && cell.gc <= maxGc + 1);
+}
+
+// Reuse existing Tank Solver logic but adapt for 'getVNeighbors'
+// (Copy-paste logic from previous, ensuring it uses the passed function)
+function runTankSolver(state, getNeighborsFunc) {
+    const boundary = new Set();
+    const constraints = [];
+
+    // Identify boundary: Hidden cells in THIS chunk adjacent to ANY revealed number
+    const relevantCells = []; // revealed numbers
+    
+    // Internal
+    state.flat().forEach(c => { if(c.status === 'revealed') relevantCells.push(c); });
+    
+    // External (same border logic as above)
+    // NOTE: For efficiency we should pass these in, but for now re-fetch
+    const chunk = chunks.get(`${Math.floor(state[0][0].gr/10)},${Math.floor(state[0][0].gr/10)}`); // rough hack for 'this' chunk ref?
+    // Actually 'state' doesn't know its chunk directly easily unless we closure it.
+    // But 'state' has gr/gc.
+    const cx = Math.floor(state[0][0].gc / CHUNK_SIZE);
+    const cy = Math.floor(state[0][0].gr / CHUNK_SIZE);
+    
+    [[0, -1], [0, 1], [-1, 0], [1, 0]].forEach(([dcy, dcx]) => {
+        const nc = chunks.get(`${cx+dcx},${cy+dcy}`);
+        if(nc) {
+            nc.grid.flat().forEach(real => {
+                if (real.isRevealed && isTouchingChunk(real, {cx, cy})) {
+                     relevantCells.push({...real, status: 'revealed', isExternal: true});
+                }
+            });
+        }
+    });
+
+    for(let cell of relevantCells){
+        if(cell.neighborMines > 0){
+            const neighbors = getNeighborsFunc(cell);
+            const hidden = neighbors.filter(n => n.status === 'hidden' && !n.isExternal); // Only solve for internal unknowns
+            const flagged = neighbors.filter(n => n.status === 'flagged');
+            
+            if(hidden.length > 0){
+                hidden.forEach(h => boundary.add(h));
+                constraints.push({
+                    cell: cell,
+                    needed: cell.neighborMines - flagged.length,
+                    targets: hidden
+                });
+            }
+        }
+    }
+
+    if(boundary.size === 0) return false;
     
     const boundaryList = Array.from(boundary);
-    // Sort boundary for better pruning? Not strictly necessary for small boards.
-
-    // Map boundary cells to index
     const bMap = new Map();
     boundaryList.forEach((b, i) => bMap.set(b, i));
-
-    // Optimize constraints: map targets to indices
     const optConstraints = constraints.map(k => ({
         needed: k.needed,
         indices: k.targets.map(t => bMap.get(t))
     }));
 
-    // 3. Backtracking
-    // solutions[i] = true if cell i can be a mine, false if it can be safe?
-    // Actually we need to count how many valid solutions have cell i as Mine vs Safe.
     const canBeMine = new Array(boundaryList.length).fill(false);
     const canBeSafe = new Array(boundaryList.length).fill(false);
-    
-    // Current assignment: 0=Safe, 1=Mine, -1=Unassigned
     const assignment = new Array(boundaryList.length).fill(-1);
 
     function solveRec(idx) {
         if(idx >= boundaryList.length){
-            // Valid solution found
             for(let i=0; i<boundaryList.length; i++){
                 if(assignment[i] === 1) canBeMine[i] = true;
                 else canBeSafe[i] = true;
             }
-            return true; // Found at least one
+            return true;
         }
-
-        // Try Safe (0)
         assignment[idx] = 0;
-        if(isValid(idx)){
-            solveRec(idx + 1);
-        }
-
-        // Try Mine (1)
+        if(isValid(idx)) solveRec(idx + 1);
         assignment[idx] = 1;
-        if(isValid(idx)){
-            solveRec(idx + 1);
-        }
-        
-        assignment[idx] = -1; // Backtrack
+        if(isValid(idx)) solveRec(idx + 1);
+        assignment[idx] = -1;
     }
 
     function isValid(uptoIdx) {
-        // Check all constraints that are fully determined or violated
         for(let k of optConstraints){
             let placed = 0;
             let unknown = 0;
@@ -670,10 +701,7 @@ function runTankSolver(state, getNeighborsFunc) {
                 if(assignment[idx] === 1) placed++;
                 else if(assignment[idx] === -1) unknown++;
             }
-            
-            // Constraint violated: Too many mines
             if(placed > k.needed) return false;
-            // Constraint violated: Not enough space for mines
             if(placed + unknown < k.needed) return false;
         }
         return true;
@@ -685,38 +713,306 @@ function runTankSolver(state, getNeighborsFunc) {
     for(let i=0; i<boundaryList.length; i++){
         const cell = boundaryList[i];
         if(canBeMine[i] && !canBeSafe[i]){
-            // MUST be a mine
             cell.status = 'flagged';
             madeProgress = true;
         } else if(!canBeMine[i] && canBeSafe[i]){
-            // MUST be safe
-            cell.status = 'revealed'; // In simulation
-             // If this was real game we'd call reveal(cell), here we simulate ripple?
-             // For solvability check, simply marking revealed is enough to trigger next logic pass
+            cell.status = 'revealed'; // Logic reveal
             madeProgress = true;
         }
     }
-    
     return madeProgress;
 }
 
+// --- GAMEPLAY HELPERS ---
 
-// --- INPUT SYSTEM ---
+function hasRevealedNeighbor(gr, gc) {
+    for(let dr=-1; dr<=1; dr++){
+        for(let dc=-1; dc<=1; dc++){
+            if(dr===0 && dc===0) continue;
+            const n = getGlobalCell(gr+dr, gc+dc);
+            if(n && n.isRevealed) return true;
+        }
+    }
+    return false;
+}
+
+function handleTap(r, c, isLong) {
+    // r, c are World Coords now (from UI)
+    // Actually UI sends chunk-relative? No, UI sends World.
+    // handlePointerUp logic needs to be robust.
+    
+    // We expect r, c to be global here?
+    // Let's check handlePointerUp below.
+    // It does `Math.floor(wx / TILE_SIZE)`. That IS global.
+    
+    if (isGameOver) return;
+    
+    const cell = getGlobalCell(r, c);
+    if (!cell) return; // Tapped void
+
+    if (isLong) {
+        if (!cell.isRevealed) toggleFlag(cell);
+        return;
+    }
+
+    if (cell.isFlagged) return;
+    if (cell.isRevealed) tryChording(cell);
+    else reveal(cell);
+}
+
+function toggleFlag(cell) {
+    cell.isFlagged = !cell.isFlagged;
+    // Vibration
+    if (navigator.vibrate) navigator.vibrate(50);
+}
+
+function reveal(cell) {
+    if (cell.isRevealed || cell.isFlagged) return;
+    
+    cell.isRevealed = true;
+    
+    if (cell.isMine) {
+        gameOver(false);
+        return;
+    }
+
+    if (cell.neighborMines === 0) {
+        // Flood Fill (Global)
+        const stack = [cell];
+        while (stack.length > 0) {
+            const current = stack.pop();
+            // Get neighbors
+            for(let dr=-1; dr<=1; dr++){
+                for(let dc=-1; dc<=1; dc++){
+                    if(dr===0 && dc===0) continue;
+                    const n = getGlobalCell(current.gr + dr, current.gc + dc);
+                    if (n && !n.isRevealed && !n.isFlagged) {
+                        n.isRevealed = true;
+                        if (n.neighborMines === 0) stack.push(n);
+                    }
+                }
+            }
+        }
+    }
+    
+    checkChunkComplete(cell);
+}
+
+function tryChording(cell) {
+    let flags = 0;
+    const neighbors = [];
+    
+    for(let dr=-1; dr<=1; dr++){
+        for(let dc=-1; dc<=1; dc++){
+            if(dr===0 && dc===0) continue;
+            const n = getGlobalCell(cell.gr + dr, cell.gc + dc);
+            if (n) {
+                neighbors.push(n);
+                if (n.isFlagged) flags++;
+            }
+        }
+    }
+
+    if (flags === cell.neighborMines) {
+        neighbors.forEach(n => {
+            if (!n.isRevealed && !n.isFlagged) reveal(n);
+        });
+    }
+}
+
+function checkChunkComplete(lastCell) {
+    // Check if the current chunk is solved
+    const chunk = chunks.get(`${Math.floor(lastCell.gc/CHUNK_SIZE)},${Math.floor(lastCell.gr/CHUNK_SIZE)}`);
+    if (!chunk || chunk.isSolved) return;
+
+    // A chunk is solved if all non-mine cells are revealed
+    let unrevealedSafe = 0;
+    chunk.grid.flat().forEach(c => {
+        if (!c.isMine && !c.isRevealed) unrevealedSafe++;
+    });
+
+    if (unrevealedSafe === 0) {
+        chunk.isSolved = true;
+        solvedChunks++;
+        
+        // Flag all mines in this chunk for aesthetics
+        chunk.grid.flat().forEach(c => {
+            if (c.isMine) c.isFlagged = true;
+        });
+
+        // SPAWN NEXT CHUNK
+        // Pick random direction (N, S, E, W) that is empty
+        const directions = [[0, -1], [0, 1], [-1, 0], [1, 0]];
+        const candidates = directions.filter(([dcy, dcx]) => {
+            return !chunks.has(`${chunk.cx + dcx},${chunk.cy + dcy}`);
+        });
+
+        if (candidates.length > 0) {
+            const [dcy, dcx] = candidates[Math.floor(Math.random() * candidates.length)];
+            const newCx = chunk.cx + dcx;
+            const newCy = chunk.cy + dcy;
+            spawnChunk(newCx, newCy, false);
+            
+            // Pan Camera
+            // Simple ease to new center
+            // (In a real app we'd use a tween library, here we just snap or rely on user panning? 
+            // Requirement said "Smooth Panning". Let's do a simple interval lerp)
+            panToChunk(newCx, newCy);
+        }
+        
+        updateHUD();
+    }
+}
+
+function panToChunk(cx, cy) {
+    // Target
+    const chunkPx = CHUNK_SIZE * TILE_SIZE;
+    const screenW = canvas.width / dpr;
+    const screenH = canvas.height / dpr;
+    const tx = (screenW/2) - ((cx * chunkPx + chunkPx/2) * camera.scale);
+    const ty = (screenH/2) - ((cy * chunkPx + chunkPx/2) * camera.scale);
+    
+    // Animate
+    let frames = 0;
+    const maxFrames = 60; // 1 sec
+    const sx = camera.x;
+    const sy = camera.y;
+    
+    function step() {
+        frames++;
+        const t = frames / maxFrames;
+        const ease = t < .5 ? 2 * t * t : -1 + (4 - 2 * t) * t; // Ease in out
+        
+        camera.x = sx + (tx - sx) * ease;
+        camera.y = sy + (ty - sy) * ease;
+        
+        if (frames < maxFrames) requestAnimationFrame(step);
+    }
+    step();
+}
+
+function gameOver(win) {
+    isGameOver = true;
+    stopTimer();
+    
+    // Reveal all mines in active chunks
+    chunks.forEach(chunk => {
+        chunk.grid.flat().forEach(cell => {
+            if (cell.isMine && !cell.isFlagged) cell.isRevealed = true;
+        });
+    });
+
+    const modal = document.getElementById('game-over-modal');
+    document.getElementById('modal-title').innerText = "Game Over";
+    document.getElementById('modal-message').innerText = `Cleared ${solvedChunks} Sectors`;
+    document.getElementById('restart-btn').innerText = "Try Again";
+    modal.style.display = 'block';
+}
+
+function startTimer() {
+    if (timerInterval) return;
+    startTime = Date.now();
+    timerInterval = setInterval(() => {
+        // Just show generic time or "Chunks Cleared" maybe?
+        // Let's stick to time.
+        const delta = Math.floor((Date.now() - startTime) / 1000);
+        document.getElementById('timer').innerText = delta;
+    }, 1000);
+}
+
+function stopTimer() {
+    if (timerInterval) clearInterval(timerInterval);
+    timerInterval = null;
+}
+
+function updateHUD() {
+    document.getElementById('mine-count').innerText = `Sectors: ${solvedChunks}`;
+}
+
+// --- RENDER LOOP ---
+
+function render() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+    ctx.save();
+    ctx.translate(camera.x, camera.y);
+    ctx.scale(camera.scale, camera.scale);
+
+    // Culling: Only draw visible chunks
+    // Get viewport in world coords
+    const screenW = canvas.width / dpr / camera.scale;
+    const screenH = canvas.height / dpr / camera.scale;
+    const viewX = -camera.x / camera.scale;
+    const viewY = -camera.y / camera.scale;
+    
+    // Draw Chunks
+    chunks.forEach(chunk => {
+        // Simple culling
+        const chX = chunk.cx * CHUNK_SIZE * TILE_SIZE;
+        const chY = chunk.cy * CHUNK_SIZE * TILE_SIZE;
+        const chSize = CHUNK_SIZE * TILE_SIZE;
+        
+        if (chX + chSize < viewX || chX > viewX + screenW ||
+            chY + chSize < viewY || chY > viewY + screenH) {
+            return;
+        }
+
+        // Draw Chunk Background
+        ctx.fillStyle = chunk.isSolved ? '#ffffff' : '#f0f2f5';
+        ctx.fillRect(chX, chY, chSize, chSize);
+
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = 'bold 24px sans-serif';
+        
+        chunk.grid.forEach(row => row.forEach(cell => {
+            const x = cell.gc * TILE_SIZE;
+            const y = cell.gr * TILE_SIZE;
+            
+            ctx.fillStyle = cell.isRevealed ? COLORS.revealed : COLORS.hidden;
+            if (cell.isRevealed && cell.isMine) ctx.fillStyle = '#ef9a9a';
+            ctx.fillRect(x + 1, y + 1, TILE_SIZE - 2, TILE_SIZE - 2);
+            
+            if (cell.isRevealed) {
+                if (cell.isMine) {
+                    ctx.fillStyle = COLORS.mine;
+                    ctx.fillText('💣', x + TILE_SIZE/2, y + TILE_SIZE/2 + 2);
+                } else if (cell.neighborMines > 0) {
+                    ctx.fillStyle = COLORS.nums[cell.neighborMines] || '#000';
+                    ctx.fillText(cell.neighborMines, x + TILE_SIZE/2, y + TILE_SIZE/2 + 2);
+                }
+            } else if (cell.isFlagged) {
+                 ctx.fillText('🚩', x + TILE_SIZE/2, y + TILE_SIZE/2 + 2);
+            }
+        }));
+        
+        // Debug: Draw Chunk Border
+        ctx.strokeStyle = '#cfd8dc';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(chX, chY, chSize, chSize);
+    });
+
+    ctx.restore();
+    requestAnimationFrame(render);
+}
+
+// --- INPUT (Adapters) ---
+// Note: Pointer logic remains mostly the same, but handlePointerUp calls handleTap
+// with Global Coordinates.
 
 function setupInput() {
-    // Touch Events
     canvas.addEventListener('touchstart', onTouchStart, {passive: false});
     canvas.addEventListener('touchmove', onTouchMove, {passive: false});
     canvas.addEventListener('touchend', onTouchEnd, {passive: false});
-    
-    // Mouse Events (wrap to look like touch)
     canvas.addEventListener('mousedown', onMouseDown);
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseup', onMouseUp);
     canvas.addEventListener('contextmenu', e => { e.preventDefault(); return false; });
-    
     document.getElementById('restart-btn').addEventListener('click', resetGame);
 }
+
+// ... Copy existing pointer logic, ensuring handleTap gets correct coords ...
+// Reuse the Input functions from original, but update the coord calc.
 
 function onTouchStart(e) {
     e.preventDefault();
@@ -726,7 +1022,6 @@ function onTouchStart(e) {
     }
     handlePointerDown();
 }
-
 function onTouchMove(e) {
     e.preventDefault();
     for (let i = 0; i < e.changedTouches.length; i++) {
@@ -736,30 +1031,21 @@ function onTouchMove(e) {
     }
     handlePointerMove();
 }
-
 function onTouchEnd(e) {
     e.preventDefault();
-    handlePointerUp(); // Logic to determine click
+    handlePointerUp(); 
     for (let i = 0; i < e.changedTouches.length; i++) {
         input.pointers.delete(e.changedTouches[i].identifier);
     }
-    if (input.pointers.size === 0) {
-        input.isDragging = false;
-    }
+    if (input.pointers.size === 0) input.isDragging = false;
 }
-
-// Mouse wrappers
 function onMouseDown(e) {
     if(e.button !== 0 && e.button !== 2) return;
     input.pointers.set(999, {x: e.clientX, y: e.clientY, startX: e.clientX, startY: e.clientY});
     handlePointerDown();
-    // If right click, flag immediately simulation? 
-    // For consistency with requirements, we rely on long press or UI toggle? 
-    // Requirement says "Long Press: Place/remove flag". 
-    // But desktop users expect right click. I'll support right click as "instant long press".
     if (e.button === 2) {
-        input.isLongPress = true; // Force long press logic immediately
-        clearTimeout(input.longPressTimer); // Clear the timer so we don't trigger twice
+        input.isLongPress = true; 
+        clearTimeout(input.longPressTimer);
     }
 }
 function onMouseMove(e) {
@@ -774,36 +1060,25 @@ function onMouseUp(e) {
     }
 }
 
-// Unified Pointer Logic
 function handlePointerDown() {
     if (input.pointers.size === 1) {
-        // Potential Click or Long Press
         input.isDragging = false;
         input.clickStartCamera = { ...camera };
-        
-        // Start Long Press Timer
         input.isLongPress = false;
-        const p = Array.from(input.pointers.values())[0]; // Get the pointer
+        const p = Array.from(input.pointers.values())[0]; 
         
         input.longPressTimer = setTimeout(() => {
             if (!input.isDragging) {
                 input.isLongPress = true;
-                
-                // Execute Flag Logic Immediately
-                // Screen to World
                 const wx = (p.x - camera.x) / camera.scale;
                 const wy = (p.y - camera.y) / camera.scale;
                 const c = Math.floor(wx / TILE_SIZE);
                 const r = Math.floor(wy / TILE_SIZE);
-                
-                handleTap(r, c, true); // true = isLongPress
-
-                // Visual feedback
+                handleTap(r, c, true); 
                 if (navigator.vibrate) navigator.vibrate(20);
             }
-        }, 500); // 500ms for long press
+        }, 500); 
     } else if (input.pointers.size === 2) {
-        // Pinch start - cancel click/longpress
         clearTimeout(input.longPressTimer);
         input.isDragging = true;
         input.baseDist = getPinchDist();
@@ -813,45 +1088,27 @@ function handlePointerDown() {
 
 function handlePointerMove() {
     const ptrs = Array.from(input.pointers.values());
-    
     if (input.pointers.size === 1) {
-        // Dragging / Panning
         const p = ptrs[0];
         const dx = p.x - p.startX;
         const dy = p.y - p.startY;
-        
-        // Threshold to cancel "Tap"
         if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
             clearTimeout(input.longPressTimer);
             input.isDragging = true;
-            
-            // Pan logic
             camera.x += (p.x - input.lastX);
             camera.y += (p.y - input.lastY);
         }
-        
         input.lastX = p.x;
         input.lastY = p.y;
-    } 
-    else if (input.pointers.size === 2) {
-        // Pinch / Pan
+    } else if (input.pointers.size === 2) {
         const dist = getPinchDist();
         const center = getPinchCenter();
-        
-        // Zoom
         const newScale = input.baseScale * (dist / input.baseDist);
-        // Clamp scale
-        const clampedScale = Math.max(0.5, Math.min(newScale, 3.0));
-        
-        // Zoom around center... simplified: just scale
-        // To do it properly we need to adjust camera.x/y based on offset.
-        // For prototype, simple scale update + center adjust is okay.
+        const clampedScale = Math.max(0.1, Math.min(newScale, 3.0)); // Allow zooming out more for infinite
         
         const oldScale = camera.scale;
         const scaleRatio = clampedScale / oldScale;
         
-        // Adjust camera position to keep center point stable
-        // World coordinates of center
         const wx = (center.x - camera.x) / oldScale;
         const wy = (center.y - camera.y) / oldScale;
         
@@ -866,18 +1123,12 @@ function handlePointerMove() {
 
 function handlePointerUp() {
     clearTimeout(input.longPressTimer);
-    
     if (!input.isDragging && input.pointers.size === 1 && !input.isLongPress) {
-        // Valid Tap (Only if not already processed as long press)
         const p = Array.from(input.pointers.values())[0];
-        
-        // Screen to World
         const wx = (p.x - camera.x) / camera.scale;
         const wy = (p.y - camera.y) / camera.scale;
-        
         const c = Math.floor(wx / TILE_SIZE);
         const r = Math.floor(wy / TILE_SIZE);
-        
         handleTap(r, c, false);
     }
 }
@@ -886,67 +1137,12 @@ function getPinchDist() {
     const ptrs = Array.from(input.pointers.values());
     return Math.hypot(ptrs[0].x - ptrs[1].x, ptrs[0].y - ptrs[1].y);
 }
-
 function getPinchCenter() {
     const ptrs = Array.from(input.pointers.values());
     return { x: (ptrs[0].x + ptrs[1].x)/2, y: (ptrs[0].y + ptrs[1].y)/2 };
 }
 
-// --- RENDER LOOP ---
-
-function render() {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    
-    // Grid Background
-    const boardW = COLS * TILE_SIZE;
-    const boardH = ROWS * TILE_SIZE;
-    
-    ctx.save();
-    ctx.translate(camera.x, camera.y);
-    ctx.scale(camera.scale, camera.scale);
-    
-    // Draw Board Background
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(0, 0, boardW, boardH);
-
-    // Draw Cells
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.font = 'bold 24px sans-serif';
-
-    for (let r = 0; r < ROWS; r++) {
-        for (let c = 0; c < COLS; c++) {
-            const cell = grid[r][c];
-            const x = c * TILE_SIZE;
-            const y = r * TILE_SIZE;
-            
-            // Base Tile
-            ctx.fillStyle = cell.isRevealed ? COLORS.revealed : COLORS.hidden;
-            if (cell.isRevealed && cell.isMine) ctx.fillStyle = '#ef9a9a'; // Exploded mine
-            ctx.fillRect(x + 1, y + 1, TILE_SIZE - 2, TILE_SIZE - 2);
-            
-            // Content
-            if (cell.isRevealed) {
-                if (cell.isMine) {
-                    ctx.fillStyle = COLORS.mine;
-                    ctx.fillText('💣', x + TILE_SIZE/2, y + TILE_SIZE/2 + 2);
-                } else if (cell.neighborMines > 0) {
-                    ctx.fillStyle = COLORS.nums[cell.neighborMines] || '#000';
-                    ctx.fillText(cell.neighborMines, x + TILE_SIZE/2, y + TILE_SIZE/2 + 2);
-                }
-            } else if (cell.isFlagged) {
-                ctx.fillText('🚩', x + TILE_SIZE/2, y + TILE_SIZE/2 + 2);
-            }
-        }
-    }
-
-    ctx.restore();
-    requestAnimationFrame(render);
-}
-
-// Start
 init();
-
 </script>
 </body>
 </html>
