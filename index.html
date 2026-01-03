@@ -199,7 +199,8 @@ class Chunk {
         this.cy = cy;
         this.density = density;
         this.isSolved = false;
-        this.grid = []; // Local 10x10 grid
+        this.isGenerated = false; // New flag
+        this.grid = []; 
         this.initGrid();
     }
 
@@ -208,8 +209,8 @@ class Chunk {
             let row = [];
             for (let c = 0; c < CHUNK_SIZE; c++) {
                 row.push({
-                    r: r, c: c, // Local coords
-                    gr: this.cy * CHUNK_SIZE + r, // Global coords
+                    r: r, c: c, 
+                    gr: this.cy * CHUNK_SIZE + r, 
                     gc: this.cx * CHUNK_SIZE + c,
                     isMine: false,
                     isRevealed: false,
@@ -267,14 +268,11 @@ function centerCameraOnChunk(cx, cy) {
     const screenW = canvas.width / dpr;
     const screenH = canvas.height / dpr;
     
-    // Target global center of the chunk
     const targetX = (cx * CHUNK_SIZE * TILE_SIZE) + (chunkPx / 2);
     const targetY = (cy * CHUNK_SIZE * TILE_SIZE) + (chunkPx / 2);
 
-    // Initial scale
     const targetScale = Math.min(screenW / (chunkPx + 100), screenH / (chunkPx + 100), 1.2);
     
-    // Animate or set? Set for now.
     camera.scale = targetScale;
     camera.x = (screenW / 2) - (targetX * camera.scale);
     camera.y = (screenH / 2) - (targetY * camera.scale);
@@ -282,17 +280,12 @@ function centerCameraOnChunk(cx, cy) {
 
 // --- CHUNK MANAGEMENT ---
 
-// Returns the Global Cell at global row/col
 function getGlobalCell(gr, gc) {
     const cx = Math.floor(gc / CHUNK_SIZE);
     const cy = Math.floor(gr / CHUNK_SIZE);
     const chunk = chunks.get(`${cx},${cy}`);
     if (!chunk) return null;
     
-    // Local conversion handles negative coords correctly via Math.floor above?
-    // Math.floor(-0.1) is -1. 
-    // If gr=-1, cy=-1. Local r?
-    // -1 % 10 = -1 in JS. We need positive modulus.
     const r = ((gr % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
     const c = ((gc % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
     
@@ -305,24 +298,50 @@ function spawnChunk(cx, cy, isFirst) {
     chunks.set(`${cx},${cy}`, chunk);
     activeChunkKey = `${cx},${cy}`;
 
-    document.getElementById('loading').style.display = 'block';
-
-    // Async generation to not freeze UI
-    setTimeout(() => {
-        generateChunk(chunk, isFirst).then(success => {
-            document.getElementById('loading').style.display = 'none';
-            if (success) {
-                updateHUD();
-                startTimer();
-            } else {
-                console.error("Failed to generate valid chunk");
-                // Fallback or retry?
-            }
-        });
-    }, 50);
+    if (isFirst) {
+        // Defer generation until first click
+        // Chunk exists but is blank. 
+        // We do NOT call generateChunk here.
+    } else {
+        document.getElementById('loading').style.display = 'block';
+        setTimeout(() => {
+            generateChunk(chunk, false).then(success => {
+                document.getElementById('loading').style.display = 'none';
+                if (success) {
+                    chunk.isGenerated = true;
+                    // Auto-reveal seam logic could go here if we wanted seamless flow without click,
+                    // but for now, we rely on the player reaching it? 
+                    // Actually, for infinite expansion, usually the new chunk is revealed immediately 
+                    // where it touches the old one?
+                    // For this prototype, let's keep it simple: Hidden until revealed? 
+                    // Wait, the requirement was "Stitched... transition...". 
+                    // If we don't reveal the seam, the user has to guess where to enter?
+                    // Ah, `generateChunk` ensures logical solvability FROM the edge.
+                    // But the user still needs to click a safe cell. 
+                    // Usually, we should auto-reveal safe cells adjacent to the opening.
+                    // Let's add that for non-first chunks.
+                    revealSeam(chunk);
+                } else {
+                    console.error("Failed to generate valid chunk");
+                }
+            });
+        }, 50);
+    }
 }
 
-async function generateChunk(chunk, isFirst) {
+function revealSeam(chunk) {
+    // Reveal any cells in the new chunk that are guaranteed safe by the solver logic
+    // or just the ones adjacent to the trigger?
+    // The safest bet for "No Guess" flow is to reveal cells that are 0-neighbors of existing 0s?
+    // Or just let the solver's 'revealed' state guide us. 
+    // For now, let's stick to user interaction except for the "First Click".
+    // Actually, if we don't reveal anything, the user sees a blank 10x10 grid next to their solved one.
+    // They click the border?
+    // Let's just update HUD.
+    updateHUD();
+}
+
+async function generateChunk(chunk, isFirst, startR = 0, startC = 0) {
     const maxAttempts = 200;
     const totalCells = CHUNK_SIZE * CHUNK_SIZE;
     const targetMines = Math.floor(totalCells * chunk.density);
@@ -336,20 +355,21 @@ async function generateChunk(chunk, isFirst) {
             c.neighborMines = 0;
         }));
 
-        // Place Mines
-        // If first chunk, ensure safe start (center)
-        // If later chunk, satisfy constraints (consistency with neighbors)
-        
         let minesPlaced = 0;
         const safeSet = new Set();
         
         if (isFirst) {
-            // Reserve center 2x2 for safe start
-            const mid = Math.floor(CHUNK_SIZE/2);
-            safeSet.add(`${mid},${mid}`);
-            safeSet.add(`${mid+1},${mid}`);
-            safeSet.add(`${mid},${mid+1}`);
-            safeSet.add(`${mid+1},${mid+1}`);
+            // Reserve Start cell AND neighbors
+            safeSet.add(`${startR},${startC}`);
+            for(let dr=-1; dr<=1; dr++){
+                for(let dc=-1; dc<=1; dc++){
+                    const nr = startR+dr; 
+                    const nc = startC+dc;
+                    if(nr>=0 && nr<CHUNK_SIZE && nc>=0 && nc<CHUNK_SIZE){
+                        safeSet.add(`${nr},${nc}`);
+                    }
+                }
+            }
         }
 
         // Random Placement
@@ -362,31 +382,18 @@ async function generateChunk(chunk, isFirst) {
             }
         }
 
-        // Calculate Numbers (internally + boundary check)
         calculateNumbers(chunk);
 
-        // CHECK 1: Consistency with neighbors
-        // The new chunk MUST NOT contradict the numbers revealed on the border of existing chunks.
         if (!checkBoundaryConsistency(chunk)) continue;
 
-        // CHECK 2: Solvability
-        // If first chunk: Solve from center.
-        // If later chunk: Solve from the "seam" (touching edges).
-        if (checkChunkSolvability(chunk, isFirst)) {
-            // Success
-            if (isFirst) {
-                 // Auto-reveal the safe start
-                 const mid = Math.floor(CHUNK_SIZE/2);
-                 reveal(chunk.grid[mid][mid]);
-            }
+        if (checkChunkSolvability(chunk, isFirst, startR, startC)) {
             return true;
         }
     }
     return false;
 }
 
-// Calculates neighbor counts for the chunk.
-// CRITICAL: Must count mines in *adjacent chunks* if they exist.
+// ... calculateNumbers, countGlobalMines, checkBoundaryConsistency remain same ...
 function calculateNumbers(chunk) {
     chunk.grid.forEach(row => row.forEach(cell => {
         if (!cell.isMine) {
@@ -394,48 +401,30 @@ function calculateNumbers(chunk) {
         }
     }));
 }
-
 function countGlobalMines(gr, gc) {
     let count = 0;
     for (let dr = -1; dr <= 1; dr++) {
         for (let dc = -1; dc <= 1; dc++) {
             if (dr === 0 && dc === 0) continue;
-            // Check global map
             const n = getGlobalCell(gr + dr, gc + dc);
             if (n && n.isMine) count++;
         }
     }
     return count;
 }
-
 function checkBoundaryConsistency(chunk) {
-    // Look at all neighbors of this chunk.
-    // For every cell in the neighbor that touches this chunk,
-    // recalculate its number. It MUST match its static 'neighborMines'.
-    // If it doesn't match, it means our new mines contradict the old clues.
-    
-    // We only need to check the "Seam".
-    // Iterate global neighbors of this chunk's border.
-    
-    const deltas = [[0, -1], [0, 1], [-1, 0], [1, 0]]; // N, S, E, W chunks
-    
+    const deltas = [[0, -1], [0, 1], [-1, 0], [1, 0]]; 
     for (let [dcy, dcx] of deltas) {
         const neighborChunk = chunks.get(`${chunk.cx + dcx},${chunk.cy + dcy}`);
         if (!neighborChunk) continue;
-
-        // For simplicity, check EVERY cell in the neighbor? No, just the edge.
-        // Optimization: Just check the relevant edge.
         let rStart = 0, rEnd = CHUNK_SIZE, cStart = 0, cEnd = CHUNK_SIZE;
-        
-        if (dcx === -1) { cStart = CHUNK_SIZE-1; cEnd = CHUNK_SIZE; } // Left Chunk's Right Edge
-        if (dcx === 1)  { cStart = 0; cEnd = 1; } // Right Chunk's Left Edge
-        if (dcy === -1) { rStart = CHUNK_SIZE-1; rEnd = CHUNK_SIZE; } // Top Chunk's Bottom Edge
-        if (dcy === 1)  { rStart = 0; rEnd = 1; } // Bottom Chunk's Top Edge
-
+        if (dcx === -1) { cStart = CHUNK_SIZE-1; cEnd = CHUNK_SIZE; } 
+        if (dcx === 1)  { cStart = 0; cEnd = 1; } 
+        if (dcy === -1) { rStart = CHUNK_SIZE-1; rEnd = CHUNK_SIZE; } 
+        if (dcy === 1)  { rStart = 0; rEnd = 1; } 
         for (let r = rStart; r < rEnd; r++) {
             for (let c = cStart; c < cEnd; c++) {
                 const nCell = neighborChunk.grid[r][c];
-                // If it's revealed, its number must be valid
                 if (nCell.isRevealed && !nCell.isMine) {
                     const currentCount = countGlobalMines(nCell.gr, nCell.gc);
                     if (currentCount !== nCell.neighborMines) return false;
@@ -446,48 +435,32 @@ function checkBoundaryConsistency(chunk) {
     return true;
 }
 
+
 // --- SOLVER ---
 
-function checkChunkSolvability(chunk, isFirst) {
-    // Virtual state for solver
-    // We need to simulate the state of the *World* locally, but only this chunk is unknown.
-    // Existing chunks are "Known".
-    
+function checkChunkSolvability(chunk, isFirst, startR, startC) {
     const state = chunk.grid.map(row => row.map(c => ({
         ...c,
-        status: 'hidden' // hidden, revealed, flagged
+        status: 'hidden'
     })));
 
     // Initial Moves
-    let queue = [];
     
     if (isFirst) {
-        const mid = Math.floor(CHUNK_SIZE/2);
-        queue.push(state[mid][mid]);
+        // Start from the user's click
+        vReveal(state[startR][startC]);
     } else {
-        // Add all cells adjacent to *revealed* cells of neighbor chunks
-        // i.e., the "Seam" is our entry point.
-        for (let r = 0; r < CHUNK_SIZE; r++) {
-            for (let c = 0; c < CHUNK_SIZE; c++) {
-                if (hasRevealedNeighbor(state[r][c].gr, state[r][c].gc)) {
-                    // Check if this cell itself should be auto-revealed?
-                    // No, the solver logic handles that. We just need to ensure the Logic CAN see it.
-                    // Actually, the "Tank" solver works on boundary. 
-                    // We just need to run the logic loop.
-                }
-            }
-        }
+        // For non-first chunks, we don't have a "start click".
+        // The solver logic must proceed entirely from the "Seam" (external revealed cells).
+        // So we just init the loop.
     }
 
-    // Solver Helper: Access Virtual or Real cells
     function getVCell(gr, gc) {
-        // Is it inside current chunk?
         const localR = gr - (chunk.cy * CHUNK_SIZE);
         const localC = gc - (chunk.cx * CHUNK_SIZE);
         if (localR >= 0 && localR < CHUNK_SIZE && localC >= 0 && localC < CHUNK_SIZE) {
             return state[localR][localC];
         }
-        // It's an external cell. Return a read-only object representing real state
         const real = getGlobalCell(gr, gc);
         if (real) {
             return {
@@ -496,7 +469,7 @@ function checkChunkSolvability(chunk, isFirst) {
                 isExternal: true
             };
         }
-        return null; // Void
+        return null;
     }
 
     function getVNeighbors(vCell) {
@@ -511,42 +484,25 @@ function checkChunkSolvability(chunk, isFirst) {
         return res;
     }
 
-    // If first chunk, we execute the first reveal manually in virtual state
-    if (isFirst) {
-        const mid = Math.floor(CHUNK_SIZE/2);
-        vReveal(state[mid][mid]);
-    }
-
-    // For subsequent chunks, the "Logic" comes from the external revealed neighbors looking IN.
-    
     function vReveal(vc) {
         if (vc.status !== 'hidden') return;
         vc.status = 'revealed';
-        if (vc.isMine) return; // Fail
+        if (vc.isMine) return; 
         if (vc.neighborMines === 0) {
             getVNeighbors(vc).forEach(n => !n.isExternal && vReveal(n));
         }
     }
 
-    // Solver Loop
     let progress = true;
     while (progress) {
         progress = false;
         let changed = false;
 
-        // Iterate ALL relevant cells:
-        // 1. Internal revealed cells
-        // 2. External revealed cells that touch this chunk
-        
         const cellsToCheck = [];
-        
-        // Add internal
         state.flat().forEach(c => {
             if (c.status === 'revealed') cellsToCheck.push(c);
         });
 
-        // Add external border cells
-        // (Optimization: we could cache these)
         const deltas = [[0, -1], [0, 1], [-1, 0], [1, 0]];
         deltas.forEach(([dcy, dcx]) => {
             const nc = chunks.get(`${chunk.cx+dcx},${chunk.cy+dcy}`);
@@ -588,14 +544,11 @@ function checkChunkSolvability(chunk, isFirst) {
             continue;
         }
 
-        // Run Tank Solver if stuck
-        // Only on boundary of UNKNOWN cells
         if (runTankSolver(state, getVNeighbors)) {
             progress = true;
         }
     }
 
-    // Verification: Are all safe cells revealed?
     for (let r = 0; r < CHUNK_SIZE; r++) {
         for (let c = 0; c < CHUNK_SIZE; c++) {
             if (state[r][c].status === 'hidden' && !state[r][c].isMine) return false;
@@ -604,35 +557,23 @@ function checkChunkSolvability(chunk, isFirst) {
     return true;
 }
 
+// ... isTouchingChunk, runTankSolver, hasRevealedNeighbor remain same ...
 function isTouchingChunk(cell, chunk) {
-    // A cell touches a chunk if it is adjacent to any cell in that chunk
-    // Simplification: Check coordinate distance
     const minGr = chunk.cy * CHUNK_SIZE;
     const maxGr = minGr + CHUNK_SIZE - 1;
     const minGc = chunk.cx * CHUNK_SIZE;
     const maxGc = minGc + CHUNK_SIZE - 1;
-    
     return (cell.gr >= minGr - 1 && cell.gr <= maxGr + 1 &&
             cell.gc >= minGc - 1 && cell.gc <= maxGc + 1);
 }
 
-// Reuse existing Tank Solver logic but adapt for 'getVNeighbors'
-// (Copy-paste logic from previous, ensuring it uses the passed function)
 function runTankSolver(state, getNeighborsFunc) {
     const boundary = new Set();
     const constraints = [];
-
-    // Identify boundary: Hidden cells in THIS chunk adjacent to ANY revealed number
-    const relevantCells = []; // revealed numbers
+    const relevantCells = []; 
     
-    // Internal
     state.flat().forEach(c => { if(c.status === 'revealed') relevantCells.push(c); });
     
-    // External (same border logic as above)
-    // NOTE: For efficiency we should pass these in, but for now re-fetch
-    const chunk = chunks.get(`${Math.floor(state[0][0].gr/10)},${Math.floor(state[0][0].gr/10)}`); // rough hack for 'this' chunk ref?
-    // Actually 'state' doesn't know its chunk directly easily unless we closure it.
-    // But 'state' has gr/gc.
     const cx = Math.floor(state[0][0].gc / CHUNK_SIZE);
     const cy = Math.floor(state[0][0].gr / CHUNK_SIZE);
     
@@ -650,7 +591,7 @@ function runTankSolver(state, getNeighborsFunc) {
     for(let cell of relevantCells){
         if(cell.neighborMines > 0){
             const neighbors = getNeighborsFunc(cell);
-            const hidden = neighbors.filter(n => n.status === 'hidden' && !n.isExternal); // Only solve for internal unknowns
+            const hidden = neighbors.filter(n => n.status === 'hidden' && !n.isExternal); 
             const flagged = neighbors.filter(n => n.status === 'flagged');
             
             if(hidden.length > 0){
@@ -716,7 +657,7 @@ function runTankSolver(state, getNeighborsFunc) {
             cell.status = 'flagged';
             madeProgress = true;
         } else if(!canBeMine[i] && canBeSafe[i]){
-            cell.status = 'revealed'; // Logic reveal
+            cell.status = 'revealed'; 
             madeProgress = true;
         }
     }
@@ -737,18 +678,36 @@ function hasRevealedNeighbor(gr, gc) {
 }
 
 function handleTap(r, c, isLong) {
-    // r, c are World Coords now (from UI)
-    // Actually UI sends chunk-relative? No, UI sends World.
-    // handlePointerUp logic needs to be robust.
-    
-    // We expect r, c to be global here?
-    // Let's check handlePointerUp below.
-    // It does `Math.floor(wx / TILE_SIZE)`. That IS global.
-    
     if (isGameOver) return;
     
     const cell = getGlobalCell(r, c);
-    if (!cell) return; // Tapped void
+    if (!cell) return; 
+
+    // FIRST CLICK GENERATION
+    const chunk = chunks.get(`${Math.floor(c/CHUNK_SIZE)},${Math.floor(r/CHUNK_SIZE)}`);
+    if (chunk && !chunk.isGenerated && !isLong) {
+        document.getElementById('loading').style.display = 'block';
+        // Force async to let UI draw loading
+        setTimeout(() => {
+            // Local coords
+            const localR = cell.r; 
+            const localC = cell.c;
+            
+            generateChunk(chunk, true, localR, localC).then(success => {
+                document.getElementById('loading').style.display = 'none';
+                if (success) {
+                    chunk.isGenerated = true;
+                    // Start timer
+                    startTimer();
+                    // Reveal the clicked cell (safe start)
+                    reveal(cell);
+                } else {
+                    alert("Failed to generate solvable start. Please try again.");
+                }
+            });
+        }, 10);
+        return;
+    }
 
     if (isLong) {
         if (!cell.isRevealed) toggleFlag(cell);
@@ -1077,7 +1036,7 @@ function handlePointerDown() {
                 handleTap(r, c, true); 
                 if (navigator.vibrate) navigator.vibrate(20);
             }
-        }, 500); 
+        }, 250); 
     } else if (input.pointers.size === 2) {
         clearTimeout(input.longPressTimer);
         input.isDragging = true;

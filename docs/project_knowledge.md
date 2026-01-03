@@ -12,7 +12,7 @@ A web-based (HTML5/JavaScript) Minesweeper designed for mobile web with an **Inf
 *   **Input System**: Custom unified pointer handling:
     *   Supports mouse and touch.
     *   **Pinch-to-Zoom** and **Drag-to-Pan** in an infinite world space.
-    *   **Long-Press** (500ms) for flagging.
+    *   **Long-Press** (250ms) for flagging.
     *   **Chording** (tapping revealed numbers to clear neighbors).
 
 ## Key Components
@@ -41,9 +41,13 @@ A web-based (HTML5/JavaScript) Minesweeper designed for mobile web with an **Inf
     *   Added smooth camera panning when new sectors are discovered.
     *   Implemented dynamic difficulty scaling (15% to 38%).
     *   Added viewport culling for performance in a potentially infinite world.
-2.  **Coordinate System Fix**: Unified CSS pixels for inputs and camera.
-3.  **Long Press UX**: Immediate flag execution on 500ms timeout with haptic feedback.
-4.  **Chording Fix**: Enabled recursive flood-fill for chording-triggered reveals.
+2.  **First Click Generation**:
+    *   Deferred board generation until the user's first click.
+    *   Ensures a "Safe Start" (zero-mine neighbor count) at the initial interaction point.
+    *   Board remains blank/hidden until the game begins.
+3.  **Coordinate System Fix**: Unified CSS pixels for inputs and camera.
+4.  **Long Press UX**: Immediate flag execution on 250ms timeout (reduced from 500ms) with haptic feedback.
+5.  **Chording Fix**: Enabled recursive flood-fill for chording-triggered reveals.
 
 ## Future Work / To-Do
 *   **Performance Optimization**: Segment the Tank solver's boundary into connected components to handle larger chunks or complex seams more efficiently.
