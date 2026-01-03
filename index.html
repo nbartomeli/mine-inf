@@ -722,7 +722,7 @@ function handleTap(r, c, isLong) {
 function toggleFlag(cell) {
     cell.isFlagged = !cell.isFlagged;
     // Vibration
-    if (navigator.vibrate) navigator.vibrate(50);
+    if (navigator.vibrate) navigator.vibrate(70);
 }
 
 function reveal(cell) {
@@ -1034,7 +1034,6 @@ function handlePointerDown() {
                 const c = Math.floor(wx / TILE_SIZE);
                 const r = Math.floor(wy / TILE_SIZE);
                 handleTap(r, c, true); 
-                if (navigator.vibrate) navigator.vibrate(20);
             }
         }, 250); 
     } else if (input.pointers.size === 2) {
