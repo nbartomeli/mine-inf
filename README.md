@@ -1,4 +1,4 @@
-# Project Ccontinuum
+# Project Continuum
 
 ## 1. Project Overview
 *Project Name:* Continuum Minesweeper
@@ -34,4 +34,5 @@ Density Progression: * Start: 15% bomb density.
 Increment: Each subsequent grid increases bomb density by 10% (multiplicative).
 
 Cap: Maximum density capped at 38% (the theoretical limit where logic-based solvability becomes statistically rare and overly cramped).
+
 
