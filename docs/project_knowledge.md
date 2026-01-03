@@ -1,47 +1,51 @@
-# Project: No-Guess Minesweeper
+# Project: Infinite No-Guess Minesweeper
 
 ## Overview
-A web-based (HTML5/JavaScript) Minesweeper prototype designed for mobile web. The core differentiator is the **"No-Guess" guarantee**: every generated board is mathematically solvable using logic alone, eliminating 50/50 guessing scenarios.
+A web-based (HTML5/JavaScript) Minesweeper designed for mobile web with an **Infinite Expansion** mechanic. The core differentiator is the **"No-Guess" guarantee**: every generated area is mathematically solvable using logic alone, even when transitioning between sectors.
 
 ## Technical Architecture
 *   **Format**: Single-file solution (`index.html`) containing HTML, CSS, and JavaScript.
-*   **Rendering**: HTML5 `<canvas>` for high-performance rendering of the grid.
-*   **Input System**: Custom pointer handling system supporting:
-    *   Mouse and Touch events unified.
-    *   **Pinch-to-Zoom** and **Drag-to-Pan**.
-    *   **Long-Press** (500ms) for flagging (with vibration feedback).
+*   **Grid System**: Infinite **Chunk-based** architecture.
+    *   The world is divided into 10x10 `Chunk` objects indexed by `cx, cy` coordinates in a `Map`.
+    *   Coordinate System: Uses global coordinates (`gr, gc`) for game logic and local coordinates (`r, c`) for chunk-internal storage.
+*   **Rendering**: HTML5 `<canvas>` with viewport-based **culling**. Only chunks currently visible in the camera view are rendered.
+*   **Input System**: Custom unified pointer handling:
+    *   Supports mouse and touch.
+    *   **Pinch-to-Zoom** and **Drag-to-Pan** in an infinite world space.
+    *   **Long-Press** (500ms) for flagging.
     *   **Chording** (tapping revealed numbers to clear neighbors).
 
 ## Key Components
 
-### 1. Board Generator & Solver
-*   **Location**: `generateSolvableBoard` and `checkSolvability` functions.
-*   **Logic**:
-    1.  Place mines randomly (respecting a safe start zone around the first click).
-    2.  Run a deterministic solver on the generated board.
-    3.  **Solver Logic**:
-        *   **Basic Heuristics**: Trivial flags/reveals (e.g., if `flags == number`, reveal rest).
-        *   **Tank Solver (Backtracking)**: Analyzes boundary components (hidden cells adjacent to numbers). It uses recursive backtracking to check all valid mine configurations for a component. If a cell is safe in *all* valid configurations, it is revealed. If it is a mine in *all* valid configurations, it is flagged.
-    4.  If the solver gets stuck before the board is solved, the board is discarded and regenerated.
+### 1. Infinite Chunk Manager
+*   **Spawning**: When a chunk is solved, the engine identifies empty adjacent coordinates (N, S, E, W) and spawns a new chunk.
+*   **Stitched Generation**: 
+    1.  **Boundary Consistency**: New mines are placed such that they do not contradict clues already revealed on the edges of neighboring chunks.
+    2.  **Seam-Aware Solvability**: The solver includes the revealed numbers of adjacent chunks when validating the new area. This ensures a logical path exists from the solved "safe" world into the new "hidden" sector.
 
-### 2. Game Loop
-*   **State**: `grid` 2D array storing cell state (`isMine`, `isRevealed`, `isFlagged`, `neighborMines`).
-*   **Rendering**: `render()` loop using `requestAnimationFrame`. Draws only the visible area based on `camera` transform (x, y, scale).
+### 2. No-Guess Solver (Tank Solver)
+*   **Basic Heuristics**: Trivial flags/reveals (e.g., if `flags == number`, reveal rest).
+*   **Tank Solver (Backtracking)**: Analyzes the boundary of hidden cells. It checks all valid mine permutations; if a cell is a mine (or safe) in *every* valid configuration, it is flagged (or revealed).
+*   **Boundary Awareness**: Adapted to work across chunk seams by treating adjacent chunk cells as "known" constants in the backtracking logic.
 
-### 3. Input Handling
-*   **Coordinate System**: 
-    *   Input events (`clientX/Y`) are in CSS pixels.
-    *   Camera position (`camera.x/y`) is in CSS pixels.
-    *   Canvas drawing context is scaled by `devicePixelRatio` for sharpness, but logic coordinates remain in CSS pixels.
-*   **Long Press**: Implemented via `setTimeout`. The flag action triggers *immediately* upon timeout (not on release), providing better tactile feedback.
+### 3. Dynamic Difficulty
+*   **Scaling**: Starts at a base mine density of 15%.
+*   **Growth**: Density increases by 10% for every solved chunk (compounding).
+*   **Cap**: Difficulty is hard-capped at 38% mine density to maintain solvability and performance.
 
-## Implementation History (Recent Changes)
+## Implementation History
 
-1.  **Coordinate System Fix**: Removed incorrect division by `devicePixelRatio` in input handlers (`handlePointerMove`, `handlePointerUp`). Inputs and Camera now consistently use CSS pixels, resolving click accuracy issues.
-2.  **Long Press UX**: Modified `handlePointerDown` to execute the flag toggle immediately when the 500ms timer expires, rather than waiting for the user to lift their finger. `handlePointerUp` was updated to ignore the lift event if a long press occurred.
-3.  **Chording Fix**: Refactored `tryChording` to delegate directly to the main `reveal()` function. This ensures that opening a '0' via chording triggers the correct recursive flood-fill (opening adjacent empty squares), which was previously failing.
+1.  **Infinite Expansion (Jan 2026)**:
+    *   Refactored single-grid logic into a `Chunk` system.
+    *   Implemented "Stitched" generation to ensure no-guess transitions between chunks.
+    *   Added smooth camera panning when new sectors are discovered.
+    *   Implemented dynamic difficulty scaling (15% to 38%).
+    *   Added viewport culling for performance in a potentially infinite world.
+2.  **Coordinate System Fix**: Unified CSS pixels for inputs and camera.
+3.  **Long Press UX**: Immediate flag execution on 500ms timeout with haptic feedback.
+4.  **Chording Fix**: Enabled recursive flood-fill for chording-triggered reveals.
 
 ## Future Work / To-Do
-*   **Performance Optimization**: The Tank solver treats the entire boundary as one component. For larger boards (beyond 10x14), segmentation (finding connected components) is necessary to avoid exponential complexity.
+*   **Performance Optimization**: Segment the Tank solver's boundary into connected components to handle larger chunks or complex seams more efficiently.
 *   **Visual Polish**: Add animations for revealing cells and flagging.
-*   **Settings**: Allow users to configure difficulty (grid size, mine count).
+*   **Settings**: Allow users to configure difficulty scaling and base density.
