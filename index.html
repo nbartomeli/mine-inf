@@ -172,6 +172,7 @@ let totalChunksGenerated = 0;
 let isGameOver = false;
 let startTime = 0;
 let timerInterval = null;
+const ripples = []; // Visual feedback array
 
 // Camera / Input
 let camera = { x: 0, y: 0, scale: 1.0 };
@@ -189,6 +190,37 @@ const ctx = canvas.getContext('2d');
 const dpr = window.devicePixelRatio || 1;
 
 // --- DATA STRUCTURES ---
+
+class Ripple {
+    constructor(x, y) {
+        this.x = x; // World coordinates
+        this.y = y;
+        this.radius = 0;
+        this.maxRadius = 60;
+        this.alpha = 1.0;
+        this.active = true;
+    }
+
+    update() {
+        this.radius += 2.5;
+        this.alpha -= 0.04;
+        if (this.alpha <= 0) {
+            this.active = false;
+        }
+    }
+
+    draw(ctx) {
+        if (!this.active) return;
+        ctx.save();
+        ctx.globalAlpha = this.alpha;
+        ctx.strokeStyle = COLORS.flag; // Use flag color
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+    }
+}
 
 class Chunk {
     constructor(index, x, y, w, h, density) {
@@ -757,6 +789,12 @@ function handleTap(r, c, isLong) {
 
 function toggleFlag(cell) {
     cell.isFlagged = !cell.isFlagged;
+    
+    // Visual Feedback (Ripple)
+    const worldX = cell.gc * TILE_SIZE + TILE_SIZE/2;
+    const worldY = cell.gr * TILE_SIZE + TILE_SIZE/2;
+    ripples.push(new Ripple(worldX, worldY));
+
     if (navigator.vibrate) navigator.vibrate(70);
 }
 
@@ -963,6 +1001,17 @@ function render() {
         ctx.strokeStyle = '#cfd8dc';
         ctx.lineWidth = 2;
         ctx.strokeRect(chX, chY, chW, chH);
+    }
+
+    // Draw Ripples
+    for (let i = ripples.length - 1; i >= 0; i--) {
+        const r = ripples[i];
+        r.update();
+        if (r.active) {
+            r.draw(ctx);
+        } else {
+            ripples.splice(i, 1);
+        }
     }
 
     ctx.restore();
