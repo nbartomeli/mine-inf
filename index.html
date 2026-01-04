@@ -196,14 +196,13 @@ class Ripple {
         this.x = x; // World coordinates
         this.y = y;
         this.radius = 0;
-        this.maxRadius = 60;
         this.alpha = 1.0;
         this.active = true;
     }
 
     update() {
-        this.radius += 2.5;
-        this.alpha -= 0.04;
+        this.radius += 5.0; // Faster expansion
+        this.alpha -= 0.025; // Slower fade for larger radius
         if (this.alpha <= 0) {
             this.active = false;
         }
@@ -213,8 +212,8 @@ class Ripple {
         if (!this.active) return;
         ctx.save();
         ctx.globalAlpha = this.alpha;
-        ctx.strokeStyle = COLORS.flag; // Use flag color
-        ctx.lineWidth = 3;
+        ctx.strokeStyle = COLORS.flag; 
+        ctx.lineWidth = 6; // Thicker line
         ctx.beginPath();
         ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
         ctx.stroke();

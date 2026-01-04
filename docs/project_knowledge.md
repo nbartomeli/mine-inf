@@ -29,7 +29,7 @@ A web-based (HTML5/JavaScript) Minesweeper designed for mobile web with an **Inf
     *   Added HUD overlay for game stats.
     *   Updated chunk placement logic to handle varying sizes.
 2.  **Visual Feedback & UX Polish**:
-    *   Added **Ripple effect** (expanding ring) for flagging feedback on all devices.
+    *   Added **Ripple effect** (pronounced expanding ring) for flagging feedback on all devices, specifically tuned for visibility under a thumb.
     *   Fixed UI interpolation bugs in HUD labels.
     *   Improved long-press responsiveness (250ms).
 3.  **First Click Generation**:
