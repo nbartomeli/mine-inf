@@ -146,15 +146,11 @@
 <script>
 /**
  * INFINITE NO-GUESS MINESWEEPER
- * Chunk-based Architecture
+ * Chunk-based Architecture with Scaling
  */
 
 // --- CONFIGURATION ---
-const CHUNK_SIZE = 10;
 const TILE_SIZE = 50;
-const BASE_DENSITY = 0.15;
-const MAX_DENSITY = 0.38;
-const DENSITY_GROWTH = 0.10; // 10% increase per chunk
 
 const COLORS = {
     hidden: '#90A4AE',
@@ -164,14 +160,15 @@ const COLORS = {
     flag: '#e53935',
     mine: '#263238',
     highlight: '#CFD8DC',
-    fog: '#cfd8dc', // Background for empty space
+    fog: '#cfd8dc', 
     nums: ['', '#1976D2', '#388E3C', '#D32F2F', '#7B1FA2', '#FF8F00', '#0097A7', '#424242', '#E91E63']
 };
 
 // --- GAME STATE ---
-const chunks = new Map(); // Key: "cx,cy", Value: Chunk Object
-let activeChunkKey = null; // The chunk currently being played
-let solvedChunks = 0;
+const chunks = []; // Array of chunks for iteration
+let activeChunk = null; 
+let solvedChunks = 0; // "Level" - 1
+let totalChunksGenerated = 0; 
 let isGameOver = false;
 let startTime = 0;
 let timerInterval = null;
@@ -194,24 +191,27 @@ const dpr = window.devicePixelRatio || 1;
 // --- DATA STRUCTURES ---
 
 class Chunk {
-    constructor(cx, cy, density) {
-        this.cx = cx;
-        this.cy = cy;
+    constructor(index, x, y, w, h, density) {
+        this.index = index;
+        this.x = x; // World Tile X (left)
+        this.y = y; // World Tile Y (top)
+        this.w = w;
+        this.h = h;
         this.density = density;
         this.isSolved = false;
-        this.isGenerated = false; // New flag
+        this.isGenerated = false;
         this.grid = []; 
         this.initGrid();
     }
 
     initGrid() {
-        for (let r = 0; r < CHUNK_SIZE; r++) {
+        for (let r = 0; r < this.h; r++) {
             let row = [];
-            for (let c = 0; c < CHUNK_SIZE; c++) {
+            for (let c = 0; c < this.w; c++) {
                 row.push({
                     r: r, c: c, 
-                    gr: this.cy * CHUNK_SIZE + r, 
-                    gc: this.cx * CHUNK_SIZE + c,
+                    gr: this.y + r, // Global Row
+                    gc: this.x + c, // Global Col
                     isMine: false,
                     isRevealed: false,
                     isFlagged: false,
@@ -222,8 +222,13 @@ class Chunk {
         }
     }
 
+    contains(gr, gc) {
+        return (gr >= this.y && gr < this.y + this.h && 
+                gc >= this.x && gc < this.x + this.w);
+    }
+
     get(r, c) {
-        if (r >= 0 && r < CHUNK_SIZE && c >= 0 && c < CHUNK_SIZE) {
+        if (r >= 0 && r < this.h && c >= 0 && c < this.w) {
             return this.grid[r][c];
         }
         return null;
@@ -233,11 +238,31 @@ class Chunk {
 // --- INITIALIZATION ---
 
 function init() {
+    setupUI();
     resizeCanvas();
     window.addEventListener('resize', resizeCanvas);
     setupInput();
     resetGame();
     requestAnimationFrame(render);
+}
+
+function setupUI() {
+    const overlay = document.getElementById('ui-overlay');
+    // Add new stats panel if not exists
+    if (!document.getElementById('stats-panel')) {
+        const stats = document.createElement('div');
+        stats.id = 'stats-panel';
+        stats.className = 'hud-panel';
+        stats.style.flexDirection = 'column';
+        stats.style.alignItems = 'flex-start';
+        stats.style.fontSize = '12px';
+        stats.innerHTML = `
+            <div>Level: <span id="level-val">1</span></div>
+            <div>Size: <span id="size-val">10x10</span></div>
+            <div>Density: <span id="density-val">12%</span></div>
+        `;
+        overlay.appendChild(stats);
+    }
 }
 
 function resizeCanvas() {
@@ -252,102 +277,147 @@ function resizeCanvas() {
 function resetGame() {
     isGameOver = false;
     solvedChunks = 0;
-    chunks.clear();
+    totalChunksGenerated = 0;
+    chunks.length = 0;
+    activeChunk = null;
     stopTimer();
     document.getElementById('timer').innerText = '0';
     document.getElementById('mine-count').innerText = '-';
     document.getElementById('game-over-modal').style.display = 'none';
 
-    // Spawn First Chunk at 0,0
-    spawnChunk(0, 0, true);
-    centerCameraOnChunk(0, 0);
+    // Spawn First Chunk centered at 0,0 roughly
+    // Starting params
+    spawnChunk(null, 0, 0, true); 
 }
 
-function centerCameraOnChunk(cx, cy) {
-    const chunkPx = CHUNK_SIZE * TILE_SIZE;
-    const screenW = canvas.width / dpr;
-    const screenH = canvas.height / dpr;
-    
-    const targetX = (cx * CHUNK_SIZE * TILE_SIZE) + (chunkPx / 2);
-    const targetY = (cy * CHUNK_SIZE * TILE_SIZE) + (chunkPx / 2);
-
-    const targetScale = Math.min(screenW / (chunkPx + 100), screenH / (chunkPx + 100), 1.2);
-    
-    camera.scale = targetScale;
-    camera.x = (screenW / 2) - (targetX * camera.scale);
-    camera.y = (screenH / 2) - (targetY * camera.scale);
+function updateStatsHUD(chunk) {
+    if (!chunk) return;
+    document.getElementById('level-val').innerText = chunk.index + 1;
+    document.getElementById('size-val').innerText = `${chunk.w}x${chunk.h}`;
+    document.getElementById('density-val').innerText = `${Math.round(chunk.density * 100)}%`;
+    document.getElementById('mine-count').innerText = `Sectors: ${solvedChunks}`;
 }
 
 // --- CHUNK MANAGEMENT ---
 
-function getGlobalCell(gr, gc) {
-    const cx = Math.floor(gc / CHUNK_SIZE);
-    const cy = Math.floor(gr / CHUNK_SIZE);
-    const chunk = chunks.get(`${cx},${cy}`);
-    if (!chunk) return null;
-    
-    const r = ((gr % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
-    const c = ((gc % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
-    
-    return chunk.get(r, c);
+function getChunkAt(gr, gc) {
+    // Linear scan is acceptable for <1000 chunks
+    for (const chunk of chunks) {
+        if (chunk.contains(gr, gc)) return chunk;
+    }
+    return null;
 }
 
-function spawnChunk(cx, cy, isFirst) {
-    const density = Math.min(MAX_DENSITY, BASE_DENSITY * Math.pow(1 + DENSITY_GROWTH, solvedChunks));
-    const chunk = new Chunk(cx, cy, density);
-    chunks.set(`${cx},${cy}`, chunk);
-    activeChunkKey = `${cx},${cy}`;
+function getGlobalCell(gr, gc) {
+    const chunk = getChunkAt(gr, gc);
+    if (!chunk) return null;
+    return chunk.grid[gr - chunk.y][gc - chunk.x];
+}
+
+function spawnChunk(parentChunk, dirX, dirY, isFirst) {
+    // Progression Logic
+    const index = totalChunksGenerated;
+    // Density: 0.12 + (index * 0.02), Cap 0.38
+    const density = Math.min(0.38, 0.12 + (index * 0.02));
+    // Size: 10 + floor(index/2)*2, Cap 30
+    const dim = Math.min(30, 10 + Math.floor(index / 2) * 2);
+    
+    let x, y, w, h;
+    w = dim;
+    h = dim;
 
     if (isFirst) {
-        // Defer generation until first click
-        // Chunk exists but is blank. 
-        // We do NOT call generateChunk here.
+        x = -Math.floor(w/2);
+        y = -Math.floor(h/2);
     } else {
+        // Calculate position relative to parent
+        // Align centers
+        const centerX = parentChunk.x + parentChunk.w/2;
+        const centerY = parentChunk.y + parentChunk.h/2;
+        
+        // Direction vectors
+        if (dirX === 1) { // East
+            x = parentChunk.x + parentChunk.w;
+            y = Math.floor(centerY - h/2);
+        } else if (dirX === -1) { // West
+            x = parentChunk.x - w;
+            y = Math.floor(centerY - h/2);
+        } else if (dirY === 1) { // South
+            y = parentChunk.y + parentChunk.h;
+            x = Math.floor(centerX - w/2);
+        } else if (dirY === -1) { // North
+            y = parentChunk.y - h;
+            x = Math.floor(centerX - w/2);
+        }
+    }
+
+    // Collision Check
+    if (!checkSpaceAvailable(x, y, w, h)) {
+        return false;
+    }
+
+    const chunk = new Chunk(index, x, y, w, h, density);
+    chunks.push(chunk);
+    activeChunk = chunk;
+    totalChunksGenerated++;
+    updateStatsHUD(chunk);
+
+    if (isFirst) {
+        centerCameraOnChunk(chunk);
+    } else {
+        // Defer generation
         document.getElementById('loading').style.display = 'block';
         setTimeout(() => {
             generateChunk(chunk, false).then(success => {
                 document.getElementById('loading').style.display = 'none';
                 if (success) {
                     chunk.isGenerated = true;
-                    // Auto-reveal seam logic could go here if we wanted seamless flow without click,
-                    // but for now, we rely on the player reaching it? 
-                    // Actually, for infinite expansion, usually the new chunk is revealed immediately 
-                    // where it touches the old one?
-                    // For this prototype, let's keep it simple: Hidden until revealed? 
-                    // Wait, the requirement was "Stitched... transition...". 
-                    // If we don't reveal the seam, the user has to guess where to enter?
-                    // Ah, `generateChunk` ensures logical solvability FROM the edge.
-                    // But the user still needs to click a safe cell. 
-                    // Usually, we should auto-reveal safe cells adjacent to the opening.
-                    // Let's add that for non-first chunks.
-                    revealSeam(chunk);
-                } else {
-                    console.error("Failed to generate valid chunk");
+                    updateStatsHUD(chunk);
                 }
             });
         }, 50);
     }
+    return true;
 }
 
-function revealSeam(chunk) {
-    // Reveal any cells in the new chunk that are guaranteed safe by the solver logic
-    // or just the ones adjacent to the trigger?
-    // The safest bet for "No Guess" flow is to reveal cells that are 0-neighbors of existing 0s?
-    // Or just let the solver's 'revealed' state guide us. 
-    // For now, let's stick to user interaction except for the "First Click".
-    // Actually, if we don't reveal anything, the user sees a blank 10x10 grid next to their solved one.
-    // They click the border?
-    // Let's just update HUD.
-    updateHUD();
+function checkSpaceAvailable(x, y, w, h) {
+    // Check overlap with existing chunks
+    // Shrink rect slightly to allow touching edges? 
+    // No, standard rect intersection. Touching edges is fine. Overlap is not.
+    for (const c of chunks) {
+        if (x < c.x + c.w && x + w > c.x &&
+            y < c.y + c.h && y + h > c.y) {
+            return false;
+        }
+    }
+    return true;
 }
+
+function centerCameraOnChunk(chunk) {
+    const screenW = canvas.width / dpr;
+    const screenH = canvas.height / dpr;
+    const chunkW = chunk.w * TILE_SIZE;
+    const chunkH = chunk.h * TILE_SIZE;
+    
+    const cx = (chunk.x * TILE_SIZE) + chunkW/2;
+    const cy = (chunk.y * TILE_SIZE) + chunkH/2;
+
+    const targetScale = Math.min(screenW / (chunkW + 100), screenH / (chunkH + 100), 1.2);
+    
+    camera.scale = targetScale;
+    camera.x = (screenW / 2) - (cx * camera.scale);
+    camera.y = (screenH / 2) - (cy * camera.scale);
+}
+
+// --- GENERATOR ---
 
 async function generateChunk(chunk, isFirst, startR = 0, startC = 0) {
     const maxAttempts = 200;
-    const totalCells = CHUNK_SIZE * CHUNK_SIZE;
+    const totalCells = chunk.w * chunk.h;
     const targetMines = Math.floor(totalCells * chunk.density);
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        // Reset Local
+        // Reset
         chunk.grid.forEach(row => row.forEach(c => {
             c.isMine = false;
             c.isRevealed = false;
@@ -359,23 +429,21 @@ async function generateChunk(chunk, isFirst, startR = 0, startC = 0) {
         const safeSet = new Set();
         
         if (isFirst) {
-            // Reserve Start cell AND neighbors
             safeSet.add(`${startR},${startC}`);
             for(let dr=-1; dr<=1; dr++){
                 for(let dc=-1; dc<=1; dc++){
                     const nr = startR+dr; 
                     const nc = startC+dc;
-                    if(nr>=0 && nr<CHUNK_SIZE && nc>=0 && nc<CHUNK_SIZE){
+                    if(nr>=0 && nr<chunk.h && nc>=0 && nc<chunk.w){
                         safeSet.add(`${nr},${nc}`);
                     }
                 }
             }
         }
 
-        // Random Placement
         while (minesPlaced < targetMines) {
-            const r = Math.floor(Math.random() * CHUNK_SIZE);
-            const c = Math.floor(Math.random() * CHUNK_SIZE);
+            const r = Math.floor(Math.random() * chunk.h);
+            const c = Math.floor(Math.random() * chunk.w);
             if (!chunk.grid[r][c].isMine && !safeSet.has(`${r},${c}`)) {
                 chunk.grid[r][c].isMine = true;
                 minesPlaced++;
@@ -393,7 +461,6 @@ async function generateChunk(chunk, isFirst, startR = 0, startC = 0) {
     return false;
 }
 
-// ... calculateNumbers, countGlobalMines, checkBoundaryConsistency remain same ...
 function calculateNumbers(chunk) {
     chunk.grid.forEach(row => row.forEach(cell => {
         if (!cell.isMine) {
@@ -401,6 +468,7 @@ function calculateNumbers(chunk) {
         }
     }));
 }
+
 function countGlobalMines(gr, gc) {
     let count = 0;
     for (let dr = -1; dr <= 1; dr++) {
@@ -412,29 +480,27 @@ function countGlobalMines(gr, gc) {
     }
     return count;
 }
+
 function checkBoundaryConsistency(chunk) {
-    const deltas = [[0, -1], [0, 1], [-1, 0], [1, 0]]; 
-    for (let [dcy, dcx] of deltas) {
-        const neighborChunk = chunks.get(`${chunk.cx + dcx},${chunk.cy + dcy}`);
-        if (!neighborChunk) continue;
-        let rStart = 0, rEnd = CHUNK_SIZE, cStart = 0, cEnd = CHUNK_SIZE;
-        if (dcx === -1) { cStart = CHUNK_SIZE-1; cEnd = CHUNK_SIZE; } 
-        if (dcx === 1)  { cStart = 0; cEnd = 1; } 
-        if (dcy === -1) { rStart = CHUNK_SIZE-1; rEnd = CHUNK_SIZE; } 
-        if (dcy === 1)  { rStart = 0; rEnd = 1; } 
-        for (let r = rStart; r < rEnd; r++) {
-            for (let c = cStart; c < cEnd; c++) {
-                const nCell = neighborChunk.grid[r][c];
-                if (nCell.isRevealed && !nCell.isMine) {
-                    const currentCount = countGlobalMines(nCell.gr, nCell.gc);
-                    if (currentCount !== nCell.neighborMines) return false;
-                }
+    // Iterate global border of this chunk
+    // Range: [y-1, y+h] x [x-1, x+w]
+    // Only check cells that are OUTSIDE this chunk but adjacent to it.
+    
+    for (let gr = chunk.y - 1; gr <= chunk.y + chunk.h; gr++) {
+        for (let gc = chunk.x - 1; gc <= chunk.x + chunk.w; gc++) {
+            // Skip internals
+            if (chunk.contains(gr, gc)) continue;
+            
+            const nCell = getGlobalCell(gr, gc);
+            if (nCell && nCell.isRevealed && !nCell.isMine) {
+                // If this neighbor is revealed, ensure our new configuration matches its count
+                const currentCount = countGlobalMines(nCell.gr, nCell.gc);
+                if (currentCount !== nCell.neighborMines) return false;
             }
         }
     }
     return true;
 }
-
 
 // --- SOLVER ---
 
@@ -444,23 +510,17 @@ function checkChunkSolvability(chunk, isFirst, startR, startC) {
         status: 'hidden'
     })));
 
-    // Initial Moves
-    
     if (isFirst) {
-        // Start from the user's click
         vReveal(state[startR][startC]);
-    } else {
-        // For non-first chunks, we don't have a "start click".
-        // The solver logic must proceed entirely from the "Seam" (external revealed cells).
-        // So we just init the loop.
     }
 
     function getVCell(gr, gc) {
-        const localR = gr - (chunk.cy * CHUNK_SIZE);
-        const localC = gc - (chunk.cx * CHUNK_SIZE);
-        if (localR >= 0 && localR < CHUNK_SIZE && localC >= 0 && localC < CHUNK_SIZE) {
-            return state[localR][localC];
+        // Internal?
+        if (gr >= chunk.y && gr < chunk.y + chunk.h &&
+            gc >= chunk.x && gc < chunk.x + chunk.w) {
+            return state[gr - chunk.y][gc - chunk.x];
         }
+        // External
         const real = getGlobalCell(gr, gc);
         if (real) {
             return {
@@ -487,7 +547,7 @@ function checkChunkSolvability(chunk, isFirst, startR, startC) {
     function vReveal(vc) {
         if (vc.status !== 'hidden') return;
         vc.status = 'revealed';
-        if (vc.isMine) return; 
+        if (vc.isMine) return;
         if (vc.neighborMines === 0) {
             getVNeighbors(vc).forEach(n => !n.isExternal && vReveal(n));
         }
@@ -499,25 +559,21 @@ function checkChunkSolvability(chunk, isFirst, startR, startC) {
         let changed = false;
 
         const cellsToCheck = [];
-        state.flat().forEach(c => {
-            if (c.status === 'revealed') cellsToCheck.push(c);
-        });
-
-        const deltas = [[0, -1], [0, 1], [-1, 0], [1, 0]];
-        deltas.forEach(([dcy, dcx]) => {
-            const nc = chunks.get(`${chunk.cx+dcx},${chunk.cy+dcy}`);
-            if(nc) {
-                nc.grid.flat().forEach(real => {
-                    if (real.isRevealed && isTouchingChunk(real, chunk)) {
-                         cellsToCheck.push({
-                             ...real,
-                             status: 'revealed',
-                             isExternal: true
-                         });
+        // Internal revealed
+        state.flat().forEach(c => { if (c.status === 'revealed') cellsToCheck.push(c); });
+        
+        // External border revealed
+        // Optimization: scan just the boundary
+        for (let gr = chunk.y - 1; gr <= chunk.y + chunk.h; gr++) {
+            for (let gc = chunk.x - 1; gc <= chunk.x + chunk.w; gc++) {
+                if (!chunk.contains(gr, gc)) {
+                    const nc = getGlobalCell(gr, gc);
+                    if (nc && nc.isRevealed && isTouchingChunk(nc, chunk)) {
+                        cellsToCheck.push({...nc, status: 'revealed', isExternal: true});
                     }
-                });
+                }
             }
-        });
+        }
 
         for (let cell of cellsToCheck) {
             if (cell.neighborMines > 0) {
@@ -539,59 +595,53 @@ function checkChunkSolvability(chunk, isFirst, startR, startC) {
             }
         }
 
-        if (changed) {
-            progress = true; 
-            continue;
-        }
-
-        if (runTankSolver(state, getVNeighbors)) {
-            progress = true;
-        }
+        if (changed) { progress = true; continue; }
+        if (runTankSolver(state, getVNeighbors)) { progress = true; }
     }
 
-    for (let r = 0; r < CHUNK_SIZE; r++) {
-        for (let c = 0; c < CHUNK_SIZE; c++) {
+    for (let r = 0; r < chunk.h; r++) {
+        for (let c = 0; c < chunk.w; c++) {
             if (state[r][c].status === 'hidden' && !state[r][c].isMine) return false;
         }
     }
     return true;
 }
 
-// ... isTouchingChunk, runTankSolver, hasRevealedNeighbor remain same ...
 function isTouchingChunk(cell, chunk) {
-    const minGr = chunk.cy * CHUNK_SIZE;
-    const maxGr = minGr + CHUNK_SIZE - 1;
-    const minGc = chunk.cx * CHUNK_SIZE;
-    const maxGc = minGc + CHUNK_SIZE - 1;
-    return (cell.gr >= minGr - 1 && cell.gr <= maxGr + 1 &&
-            cell.gc >= minGc - 1 && cell.gc <= maxGc + 1);
+    return (cell.gr >= chunk.y - 1 && cell.gr <= chunk.y + chunk.h &&
+            cell.gc >= chunk.x - 1 && cell.gc <= chunk.x + chunk.w);
 }
 
 function runTankSolver(state, getNeighborsFunc) {
     const boundary = new Set();
     const constraints = [];
     const relevantCells = []; 
-    
+
+    // Gather revealed cells (internal + external boundary)
     state.flat().forEach(c => { if(c.status === 'revealed') relevantCells.push(c); });
     
-    const cx = Math.floor(state[0][0].gc / CHUNK_SIZE);
-    const cy = Math.floor(state[0][0].gr / CHUNK_SIZE);
-    
-    [[0, -1], [0, 1], [-1, 0], [1, 0]].forEach(([dcy, dcx]) => {
-        const nc = chunks.get(`${cx+dcx},${cy+dcy}`);
-        if(nc) {
-            nc.grid.flat().forEach(real => {
-                if (real.isRevealed && isTouchingChunk(real, {cx, cy})) {
-                     relevantCells.push({...real, status: 'revealed', isExternal: true});
-                }
-            });
+    // External boundary
+    const chunk = { // Mock chunk obj for bounds check in loop
+        x: state[0][0].gc, y: state[0][0].gr, 
+        w: state[0].length, h: state.length,
+        contains: function(gr, gc) {
+             return (gr >= this.y && gr < this.y + this.h && gc >= this.x && gc < this.x + this.w);
         }
-    });
+    };
+    
+    for (let gr = chunk.y - 1; gr <= chunk.y + chunk.h; gr++) {
+        for (let gc = chunk.x - 1; gc <= chunk.x + chunk.w; gc++) {
+            if (!chunk.contains(gr, gc)) {
+                const nc = getGlobalCell(gr, gc);
+                if (nc && nc.isRevealed) relevantCells.push({...nc, status: 'revealed', isExternal: true});
+            }
+        }
+    }
 
     for(let cell of relevantCells){
         if(cell.neighborMines > 0){
             const neighbors = getNeighborsFunc(cell);
-            const hidden = neighbors.filter(n => n.status === 'hidden' && !n.isExternal); 
+            const hidden = neighbors.filter(n => n.status === 'hidden' && !n.isExternal);
             const flagged = neighbors.filter(n => n.status === 'flagged');
             
             if(hidden.length > 0){
@@ -657,7 +707,7 @@ function runTankSolver(state, getNeighborsFunc) {
             cell.status = 'flagged';
             madeProgress = true;
         } else if(!canBeMine[i] && canBeSafe[i]){
-            cell.status = 'revealed'; 
+            cell.status = 'revealed'; // Logic reveal
             madeProgress = true;
         }
     }
@@ -666,30 +716,17 @@ function runTankSolver(state, getNeighborsFunc) {
 
 // --- GAMEPLAY HELPERS ---
 
-function hasRevealedNeighbor(gr, gc) {
-    for(let dr=-1; dr<=1; dr++){
-        for(let dc=-1; dc<=1; dc++){
-            if(dr===0 && dc===0) continue;
-            const n = getGlobalCell(gr+dr, gc+dc);
-            if(n && n.isRevealed) return true;
-        }
-    }
-    return false;
-}
-
 function handleTap(r, c, isLong) {
     if (isGameOver) return;
     
     const cell = getGlobalCell(r, c);
-    if (!cell) return; 
+    if (!cell) return;
 
-    // FIRST CLICK GENERATION
-    const chunk = chunks.get(`${Math.floor(c/CHUNK_SIZE)},${Math.floor(r/CHUNK_SIZE)}`);
+    const chunk = getChunkAt(r, c);
+    
     if (chunk && !chunk.isGenerated && !isLong) {
         document.getElementById('loading').style.display = 'block';
-        // Force async to let UI draw loading
         setTimeout(() => {
-            // Local coords
             const localR = cell.r; 
             const localC = cell.c;
             
@@ -697,10 +734,9 @@ function handleTap(r, c, isLong) {
                 document.getElementById('loading').style.display = 'none';
                 if (success) {
                     chunk.isGenerated = true;
-                    // Start timer
                     startTimer();
-                    // Reveal the clicked cell (safe start)
                     reveal(cell);
+                    updateStatsHUD(chunk);
                 } else {
                     alert("Failed to generate solvable start. Please try again.");
                 }
@@ -721,7 +757,6 @@ function handleTap(r, c, isLong) {
 
 function toggleFlag(cell) {
     cell.isFlagged = !cell.isFlagged;
-    // Vibration
     if (navigator.vibrate) navigator.vibrate(70);
 }
 
@@ -736,11 +771,9 @@ function reveal(cell) {
     }
 
     if (cell.neighborMines === 0) {
-        // Flood Fill (Global)
         const stack = [cell];
         while (stack.length > 0) {
             const current = stack.pop();
-            // Get neighbors
             for(let dr=-1; dr<=1; dr++){
                 for(let dc=-1; dc<=1; dc++){
                     if(dr===0 && dc===0) continue;
@@ -760,7 +793,6 @@ function reveal(cell) {
 function tryChording(cell) {
     let flags = 0;
     const neighbors = [];
-    
     for(let dr=-1; dr<=1; dr++){
         for(let dc=-1; dc<=1; dc++){
             if(dr===0 && dc===0) continue;
@@ -771,7 +803,6 @@ function tryChording(cell) {
             }
         }
     }
-
     if (flags === cell.neighborMines) {
         neighbors.forEach(n => {
             if (!n.isRevealed && !n.isFlagged) reveal(n);
@@ -780,11 +811,9 @@ function tryChording(cell) {
 }
 
 function checkChunkComplete(lastCell) {
-    // Check if the current chunk is solved
-    const chunk = chunks.get(`${Math.floor(lastCell.gc/CHUNK_SIZE)},${Math.floor(lastCell.gr/CHUNK_SIZE)}`);
+    const chunk = getChunkAt(lastCell.gr, lastCell.gc);
     if (!chunk || chunk.isSolved) return;
 
-    // A chunk is solved if all non-mine cells are revealed
     let unrevealedSafe = 0;
     chunk.grid.flat().forEach(c => {
         if (!c.isMine && !c.isRevealed) unrevealedSafe++;
@@ -794,53 +823,50 @@ function checkChunkComplete(lastCell) {
         chunk.isSolved = true;
         solvedChunks++;
         
-        // Flag all mines in this chunk for aesthetics
         chunk.grid.flat().forEach(c => {
             if (c.isMine) c.isFlagged = true;
         });
 
-        // SPAWN NEXT CHUNK
-        // Pick random direction (N, S, E, W) that is empty
+        // Spawn NEXT
         const directions = [[0, -1], [0, 1], [-1, 0], [1, 0]];
-        const candidates = directions.filter(([dcy, dcx]) => {
-            return !chunks.has(`${chunk.cx + dcx},${chunk.cy + dcy}`);
-        });
-
-        if (candidates.length > 0) {
-            const [dcy, dcx] = candidates[Math.floor(Math.random() * candidates.length)];
-            const newCx = chunk.cx + dcx;
-            const newCy = chunk.cy + dcy;
-            spawnChunk(newCx, newCy, false);
-            
-            // Pan Camera
-            // Simple ease to new center
-            // (In a real app we'd use a tween library, here we just snap or rely on user panning? 
-            // Requirement said "Smooth Panning". Let's do a simple interval lerp)
-            panToChunk(newCx, newCy);
+        // Randomize order
+        directions.sort(() => Math.random() - 0.5);
+        
+        let spawned = false;
+        for (let [dcy, dcx] of directions) {
+            // Attempt spawn
+            if (spawnChunk(chunk, dcx, dcy, false)) {
+                spawned = true;
+                panToChunk(activeChunk);
+                break;
+            }
         }
         
-        updateHUD();
+        updateStatsHUD(activeChunk);
     }
 }
 
-function panToChunk(cx, cy) {
-    // Target
-    const chunkPx = CHUNK_SIZE * TILE_SIZE;
+function panToChunk(chunk) {
+    const chunkW = chunk.w * TILE_SIZE;
+    const chunkH = chunk.h * TILE_SIZE;
+    const cx = (chunk.x * TILE_SIZE) + chunkW/2;
+    const cy = (chunk.y * TILE_SIZE) + chunkH/2;
+    
     const screenW = canvas.width / dpr;
     const screenH = canvas.height / dpr;
-    const tx = (screenW/2) - ((cx * chunkPx + chunkPx/2) * camera.scale);
-    const ty = (screenH/2) - ((cy * chunkPx + chunkPx/2) * camera.scale);
     
-    // Animate
+    const tx = (screenW/2) - (cx * camera.scale);
+    const ty = (screenH/2) - (cy * camera.scale);
+    
     let frames = 0;
-    const maxFrames = 60; // 1 sec
+    const maxFrames = 60; 
     const sx = camera.x;
     const sy = camera.y;
     
     function step() {
         frames++;
         const t = frames / maxFrames;
-        const ease = t < .5 ? 2 * t * t : -1 + (4 - 2 * t) * t; // Ease in out
+        const ease = t < .5 ? 2 * t * t : -1 + (4 - 2 * t) * t; 
         
         camera.x = sx + (tx - sx) * ease;
         camera.y = sy + (ty - sy) * ease;
@@ -854,7 +880,6 @@ function gameOver(win) {
     isGameOver = true;
     stopTimer();
     
-    // Reveal all mines in active chunks
     chunks.forEach(chunk => {
         chunk.grid.flat().forEach(cell => {
             if (cell.isMine && !cell.isFlagged) cell.isRevealed = true;
@@ -872,8 +897,6 @@ function startTimer() {
     if (timerInterval) return;
     startTime = Date.now();
     timerInterval = setInterval(() => {
-        // Just show generic time or "Chunks Cleared" maybe?
-        // Let's stick to time.
         const delta = Math.floor((Date.now() - startTime) / 1000);
         document.getElementById('timer').innerText = delta;
     }, 1000);
@@ -882,10 +905,6 @@ function startTimer() {
 function stopTimer() {
     if (timerInterval) clearInterval(timerInterval);
     timerInterval = null;
-}
-
-function updateHUD() {
-    document.getElementById('mine-count').innerText = `Sectors: ${solvedChunks}`;
 }
 
 // --- RENDER LOOP ---
@@ -897,28 +916,24 @@ function render() {
     ctx.translate(camera.x, camera.y);
     ctx.scale(camera.scale, camera.scale);
 
-    // Culling: Only draw visible chunks
-    // Get viewport in world coords
     const screenW = canvas.width / dpr / camera.scale;
     const screenH = canvas.height / dpr / camera.scale;
     const viewX = -camera.x / camera.scale;
     const viewY = -camera.y / camera.scale;
     
-    // Draw Chunks
-    chunks.forEach(chunk => {
-        // Simple culling
-        const chX = chunk.cx * CHUNK_SIZE * TILE_SIZE;
-        const chY = chunk.cy * CHUNK_SIZE * TILE_SIZE;
-        const chSize = CHUNK_SIZE * TILE_SIZE;
+    for (const chunk of chunks) {
+        const chX = chunk.x * TILE_SIZE;
+        const chY = chunk.y * TILE_SIZE;
+        const chW = chunk.w * TILE_SIZE;
+        const chH = chunk.h * TILE_SIZE;
         
-        if (chX + chSize < viewX || chX > viewX + screenW ||
-            chY + chSize < viewY || chY > viewY + screenH) {
-            return;
+        if (chX + chW < viewX || chX > viewX + screenW ||
+            chY + chH < viewY || chY > viewY + screenH) {
+            continue;
         }
 
-        // Draw Chunk Background
         ctx.fillStyle = chunk.isSolved ? '#ffffff' : '#f0f2f5';
-        ctx.fillRect(chX, chY, chSize, chSize);
+        ctx.fillRect(chX, chY, chW, chH);
 
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
@@ -945,19 +960,16 @@ function render() {
             }
         }));
         
-        // Debug: Draw Chunk Border
         ctx.strokeStyle = '#cfd8dc';
         ctx.lineWidth = 2;
-        ctx.strokeRect(chX, chY, chSize, chSize);
-    });
+        ctx.strokeRect(chX, chY, chW, chH);
+    }
 
     ctx.restore();
     requestAnimationFrame(render);
 }
 
 // --- INPUT (Adapters) ---
-// Note: Pointer logic remains mostly the same, but handlePointerUp calls handleTap
-// with Global Coordinates.
 
 function setupInput() {
     canvas.addEventListener('touchstart', onTouchStart, {passive: false});
@@ -969,9 +981,6 @@ function setupInput() {
     canvas.addEventListener('contextmenu', e => { e.preventDefault(); return false; });
     document.getElementById('restart-btn').addEventListener('click', resetGame);
 }
-
-// ... Copy existing pointer logic, ensuring handleTap gets correct coords ...
-// Reuse the Input functions from original, but update the coord calc.
 
 function onTouchStart(e) {
     e.preventDefault();
@@ -1065,14 +1074,12 @@ function handlePointerMove() {
         const clampedScale = Math.max(0.1, Math.min(newScale, 3.0)); // Allow zooming out more for infinite
         
         const oldScale = camera.scale;
-        const scaleRatio = clampedScale / oldScale;
-        
         const wx = (center.x - camera.x) / oldScale;
         const wy = (center.y - camera.y) / oldScale;
         
-        camera.x = center.x - wx * clampedScale;
-        camera.y = center.y - wy * clampedScale;
-        camera.scale = clampedScale;
+        camera.x = center.x - wx * newScale;
+        camera.y = center.y - wy * newScale;
+        camera.scale = newScale;
 
         input.lastX = center.x;
         input.lastY = center.y;
